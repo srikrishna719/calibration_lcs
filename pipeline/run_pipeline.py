@@ -1,18 +1,18 @@
-"""End-to-end calibration pipeline orchestration."""
+"""End-to-end calibration pipeline orchestration.
+
+Splits the workflow into discrete stages that can be run independently
+from the Streamlit UI or as a single end-to-end call.
+"""
 
 from __future__ import annotations
 
-import io
 import json
-import pickle
 from pathlib import Path
 from typing import Any, Dict
 
-import pandas as pd
-
 try:
     import yaml
-except ImportError:  # pragma: no cover - optional dependency
+except ImportError:  # pragma: no cover
     yaml = None
 
 from evaluation.comparator import create_leaderboard, select_best_model
@@ -20,23 +20,26 @@ from models.predict import predict_with_model
 from models.train import train_models
 from modules.alignment import align_and_merge_datasets
 from modules.data_loader import load_and_validate_dataset
+from modules.drift_analysis import generate_post_analysis_outputs
+from modules.eda import generate_eda_outputs
+from modules.exporter import (
+    export_config_json_bytes,
+    export_config_yaml_bytes,
+    export_dataframe_csv_bytes,
+    export_metadata_json_bytes,
+    export_metrics_json_bytes,
+    export_model_bytes,
+)
 from modules.feature_engineering import engineer_features
 from modules.preprocessing import preprocess_dataset
 
 
+# -----------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------
+
 def load_config(config_path: str | Path) -> Dict[str, Any]:
-    """Load pipeline configuration from YAML or JSON.
-
-    Parameters
-    ----------
-    config_path:
-        Path to a YAML or JSON configuration file.
-
-    Returns
-    -------
-    Dict[str, Any]
-        Parsed configuration dictionary.
-    """
+    """Load pipeline configuration from YAML or JSON."""
     path = Path(config_path)
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
@@ -44,151 +47,294 @@ def load_config(config_path: str | Path) -> Dict[str, Any]:
     if path.suffix.lower() in {".yaml", ".yml"}:
         if yaml is None:
             raise ImportError("PyYAML is required to read YAML configuration files.")
-        with path.open("r", encoding="utf-8") as file:
-            return yaml.safe_load(file)
+        with path.open("r", encoding="utf-8") as f:
+            return yaml.safe_load(f)
 
     if path.suffix.lower() == ".json":
-        with path.open("r", encoding="utf-8") as file:
-            return json.load(file)
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
 
     raise ValueError("Config file must be YAML, YML, or JSON.")
 
 
-def export_model_bytes(model: Any) -> bytes:
-    """Serialize a trained model to bytes.
+# -----------------------------------------------------------------------
+# Stage 1 — Data Loading
+# -----------------------------------------------------------------------
 
-    Parameters
-    ----------
-    model:
-        Trained model object.
-
-    Returns
-    -------
-    bytes
-        Serialized model bytes.
-    """
-    buffer = io.BytesIO()
-    pickle.dump(model, buffer)
-    return buffer.getvalue()
-
-
-def run_calibration_pipeline(
+def load_input_data(
     reference_source: Any,
     sensor_source: Any,
     config: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Run the full calibration pipeline from raw input to model selection.
-
-    Parameters
-    ----------
-    reference_source:
-        Reference dataset path, file-like object, or DataFrame.
-    sensor_source:
-        Sensor dataset path, file-like object, or DataFrame.
-    config:
-        Pipeline configuration dictionary.
-
-    Returns
-    -------
-    Dict[str, Any]
-        Pipeline outputs for UI and downstream export.
-    """
-    data_config = config["data"]
-    timestamp_column = str(data_config["timestamp_column"])
-    target_column = str(data_config["target_column"])
-    sensor_prefix = str(data_config.get("sensor_prefix", "sensor"))
-    reference_prefix = str(data_config.get("reference_prefix", "reference"))
-    reference_target_column = f"{reference_prefix}_{target_column}"
+    """Load and validate the reference and LCS datasets."""
+    data_cfg = config["data"]
+    ts_col = str(data_cfg["timestamp_column"])
+    tz = str(data_cfg.get("timezone", "UTC"))
 
     reference_df = load_and_validate_dataset(
         source=reference_source,
-        timestamp_column=timestamp_column,
+        timestamp_column=ts_col,
         dataset_name="Reference",
+        timezone=tz,
     )
     sensor_df = load_and_validate_dataset(
         source=sensor_source,
-        timestamp_column=timestamp_column,
-        dataset_name="Sensor",
+        timestamp_column=ts_col,
+        dataset_name="LCS",
+        timezone=tz,
     )
+    return {
+        "reference_raw": reference_df,
+        "sensor_raw": sensor_df,
+    }
 
-    reference_processed, reference_artifacts = preprocess_dataset(
+
+# -----------------------------------------------------------------------
+# Stage 2 — Preprocessing
+# -----------------------------------------------------------------------
+
+def run_preprocessing_stage(
+    reference_df: Any,
+    sensor_df: Any,
+    config: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Clean both datasets independently.
+
+    Respects ``config['preprocessing']['apply_to_reference']`` (bool, default
+    False) which controls whether outlier removal is applied to the reference
+    dataset.  Missing-value imputation is always applied to both.
+    """
+    data_cfg = config["data"]
+    ts_col = str(data_cfg["timestamp_column"])
+    target_col = str(data_cfg["target_column"])
+
+    prep_cfg = config["preprocessing"]
+    apply_to_reference = bool(prep_cfg.get("apply_to_reference", False))
+
+    # Build a reference-specific config — optionally disable outlier removal
+    ref_prep_cfg = dict(prep_cfg)
+    if not apply_to_reference:
+        ref_prep_cfg["outlier_method"] = "none"
+
+    ref_clean, ref_summary = preprocess_dataset(
         dataframe=reference_df,
-        timestamp_column=timestamp_column,
-        config=config["preprocessing"],
-        exclude_columns=[target_column],
+        timestamp_column=ts_col,
+        config=ref_prep_cfg,
+        exclude_columns=[target_col],
     )
-    sensor_processed, sensor_artifacts = preprocess_dataset(
+    sen_clean, sen_summary = preprocess_dataset(
         dataframe=sensor_df,
-        timestamp_column=timestamp_column,
-        config=config["preprocessing"],
+        timestamp_column=ts_col,
+        config=prep_cfg,
     )
+    return {
+        "reference_processed": ref_clean,
+        "sensor_processed": sen_clean,
+        "preprocessing_summary": {
+            "reference": ref_summary,
+            "sensor": sen_summary,
+        },
+    }
 
-    aligned_df, alignment_metadata = align_and_merge_datasets(
-        reference_df=reference_processed,
-        sensor_df=sensor_processed,
-        timestamp_column=timestamp_column,
-        reference_target_column=target_column,
+
+# -----------------------------------------------------------------------
+# Stage 3 — Alignment
+# -----------------------------------------------------------------------
+
+def run_alignment_stage(
+    reference_df: Any,
+    sensor_df: Any,
+    config: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Resample, lag-detect, and merge the two datasets."""
+    data_cfg = config["data"]
+    ts_col = str(data_cfg["timestamp_column"])
+    target_col = str(data_cfg["target_column"])
+    sensor_prefix = str(data_cfg.get("sensor_prefix", "sensor"))
+    reference_prefix = str(data_cfg.get("reference_prefix", "reference"))
+
+    merged_df, alignment_meta = align_and_merge_datasets(
+        reference_df=reference_df,
+        sensor_df=sensor_df,
+        timestamp_column=ts_col,
+        reference_target_column=target_col,
         sensor_prefix=sensor_prefix,
         reference_prefix=reference_prefix,
         config=config["alignment"],
     )
+    return {
+        "merged_data": merged_df,
+        "alignment_metadata": alignment_meta,
+    }
+
+
+# -----------------------------------------------------------------------
+# Stage 4 — EDA
+# -----------------------------------------------------------------------
+
+def run_eda_stage(
+    merged_df: Any,
+    config: Dict[str, Any],
+    raw_merged_df: Any = None,
+) -> Dict[str, Any]:
+    """Generate exploratory data analysis outputs."""
+    ts_col = str(config["data"]["timestamp_column"])
+    return generate_eda_outputs(
+        merged_df,
+        timestamp_column=ts_col,
+        raw_dataframe=raw_merged_df,
+    )
+
+
+# -----------------------------------------------------------------------
+# Stage 5 — Feature Engineering + Modelling
+# -----------------------------------------------------------------------
+
+def run_modeling_stage(
+    merged_df: Any,
+    config: Dict[str, Any],
+    feature_subset: list | None = None,
+) -> Dict[str, Any]:
+    """Engineer features, train models, rank them, and produce a calibrated dataset.
+
+    Parameters
+    ----------
+    feature_subset:
+        Optional list of column names to restrict training features.
+        When None, all engineered features are used.
+    """
+    data_cfg = config["data"]
+    ts_col = str(data_cfg["timestamp_column"])
+    target_col = f"{data_cfg['reference_prefix']}_{data_cfg['target_column']}"
 
     featured_df = engineer_features(
-        dataframe=aligned_df,
-        timestamp_column=timestamp_column,
-        target_column=reference_target_column,
+        dataframe=merged_df,
+        timestamp_column=ts_col,
+        target_column=target_col,
         config=config["feature_engineering"],
     )
     if featured_df.empty:
-        raise ValueError("Feature engineering removed all rows. Adjust lag or rolling window settings.")
+        raise ValueError("Feature engineering removed all rows. Adjust lag or rolling settings.")
 
-    training_results = train_models(
+    results = train_models(
         dataframe=featured_df,
-        target_column=reference_target_column,
-        timestamp_column=timestamp_column,
+        target_column=target_col,
+        timestamp_column=ts_col,
         config=config["training"],
         random_state=int(config.get("app", {}).get("random_state", 42)),
+        feature_subset=feature_subset,
     )
-    leaderboard = create_leaderboard(
-        training_results=training_results,
-        config=config["evaluation"],
-    )
-    best_result = select_best_model(training_results=training_results, leaderboard=leaderboard)
-    result_by_model = {result.model_name: result for result in training_results}
+    leaderboard = create_leaderboard(results, config["evaluation"])
+    best = select_best_model(results, leaderboard)
 
-    calibrated_predictions = predict_with_model(
-        model=best_result.model,
+    predictions = predict_with_model(
+        model=best.model,
         dataframe=featured_df,
-        target_column=reference_target_column,
-        timestamp_column=timestamp_column,
+        target_column=target_col,
+        timestamp_column=ts_col,
     )
-    calibrated_dataset = featured_df[[timestamp_column, reference_target_column]].merge(
-        calibrated_predictions,
-        on=timestamp_column,
-        how="left",
-    ).rename(
-        columns={
-            reference_target_column: "reference_value",
-            "prediction": "calibrated_prediction",
-        }
+    calibrated = (
+        featured_df[[ts_col, target_col]]
+        .merge(predictions, on=ts_col, how="left")
+        .rename(columns={target_col: "reference_value", "prediction": "calibrated_value"})
     )
 
     return {
-        "reference_processed": reference_processed,
-        "sensor_processed": sensor_processed,
-        "aligned_data": aligned_df,
         "featured_data": featured_df,
+        "training_results": {r.model_name: r for r in results},
+        "training_results_list": results,
         "leaderboard": leaderboard,
-        "training_results": result_by_model,
-        "best_model_name": best_result.model_name,
-        "best_model": best_result.model,
-        "best_model_metrics": best_result.metrics,
-        "best_model_predictions": best_result.predictions,
-        "calibrated_dataset": calibrated_dataset,
-        "alignment_metadata": alignment_metadata,
-        "preprocessing_artifacts": {
-            "reference": reference_artifacts,
-            "sensor": sensor_artifacts,
-        },
-        "serialized_model": export_model_bytes(best_result.model),
+        "best_model_name": best.model_name,
+        "best_model": best.model,
+        "best_model_metrics": best.metrics,
+        "calibrated_dataset": calibrated,
+    }
+
+
+# -----------------------------------------------------------------------
+# Stage 6 — Post-Calibration Analysis
+# -----------------------------------------------------------------------
+
+def run_post_analysis_stage(
+    predictions_df: Any,
+    config: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Run drift detection and residual analysis."""
+    drift_cfg = config.get("drift_analysis", {})
+    rolling_window = int(drift_cfg.get("rolling_window", 6))
+    drift_threshold = float(drift_cfg.get("drift_threshold", 1.5))
+    return generate_post_analysis_outputs(
+        predictions_df,
+        rolling_window=rolling_window,
+        drift_threshold=drift_threshold,
+    )
+
+
+# -----------------------------------------------------------------------
+# Stage 7 — Export
+# -----------------------------------------------------------------------
+
+def build_export_bundle(
+    calibrated_dataset: Any,
+    selected_model: Any,
+    model_name: str,
+    metrics: Dict[str, Any],
+    feature_names: list,
+    config: Dict[str, Any],
+) -> Dict[str, bytes]:
+    """Create exportable artefacts for the selected model."""
+    return {
+        "calibrated_dataset_csv": export_dataframe_csv_bytes(calibrated_dataset),
+        "model_pickle": export_model_bytes(selected_model),
+        "metrics_json": export_metrics_json_bytes(metrics),
+        "config_json": export_config_json_bytes(config),
+        "config_yaml": export_config_yaml_bytes(config),
+        "metadata_json": export_metadata_json_bytes(
+            model_name=model_name,
+            features_used=feature_names,
+            metrics=metrics,
+            config=config,
+        ),
+    }
+
+
+# -----------------------------------------------------------------------
+# Full pipeline (non-interactive)
+# -----------------------------------------------------------------------
+
+def run_full_pipeline(
+    reference_source: Any,
+    sensor_source: Any,
+    config: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Run the complete calibration pipeline end to end."""
+    data = load_input_data(reference_source, sensor_source, config)
+    preprocess = run_preprocessing_stage(
+        data["reference_raw"], data["sensor_raw"], config
+    )
+    alignment = run_alignment_stage(
+        preprocess["reference_processed"], preprocess["sensor_processed"], config
+    )
+    eda = run_eda_stage(alignment["merged_data"], config)
+    modeling = run_modeling_stage(alignment["merged_data"], config)
+
+    best_result = modeling["training_results"][modeling["best_model_name"]]
+    post = run_post_analysis_stage(best_result.full_predictions, config)
+
+    export = build_export_bundle(
+        calibrated_dataset=modeling["calibrated_dataset"],
+        selected_model=modeling["best_model"],
+        model_name=modeling["best_model_name"],
+        metrics=modeling["best_model_metrics"],
+        feature_names=best_result.feature_names,
+        config=config,
+    )
+    return {
+        **data,
+        **preprocess,
+        **alignment,
+        **eda,
+        **modeling,
+        **post,
+        **export,
     }

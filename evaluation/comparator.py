@@ -1,4 +1,4 @@
-"""Model comparison helpers."""
+"""Model comparison utilities — leaderboard and best-model selection."""
 
 from __future__ import annotations
 
@@ -7,6 +7,21 @@ from typing import Dict, List
 import pandas as pd
 
 from models.train import TrainingResult
+
+
+# Columns displayed on the leaderboard, in order.
+LEADERBOARD_COLUMNS = [
+    "rank",
+    "model_name",
+    "rmse",
+    "mae",
+    "r2",
+    "mape",
+    "bias",
+    "pearson_r",
+    "slope",
+    "intercept",
+]
 
 
 def create_leaderboard(
@@ -18,22 +33,22 @@ def create_leaderboard(
     Parameters
     ----------
     training_results:
-        Outputs from model training.
+        Output from the training stage.
     config:
-        Evaluation settings.
+        Evaluation configuration with ``sort_by`` and ``ascending`` keys.
 
     Returns
     -------
     pd.DataFrame
-        Sorted leaderboard.
+        Ranked model leaderboard.
     """
-    leaderboard = pd.DataFrame(
-        [
-            {"model": result.model_name, **result.metrics}
-            for result in training_results
-        ]
-    )
+    rows = []
+    for result in training_results:
+        row = {"model_name": result.model_name}
+        row.update(result.metrics)
+        rows.append(row)
 
+    leaderboard = pd.DataFrame(rows)
     if leaderboard.empty:
         raise ValueError("No model training results were available for comparison.")
 
@@ -42,7 +57,15 @@ def create_leaderboard(
     if sort_by not in leaderboard.columns:
         sort_by = "rmse"
 
-    return leaderboard.sort_values(by=sort_by, ascending=ascending).reset_index(drop=True)
+    leaderboard = leaderboard.sort_values(sort_by, ascending=ascending).reset_index(drop=True)
+    leaderboard.insert(0, "rank", range(1, len(leaderboard) + 1))
+
+    # Reorder columns for presentation — keep extras at the end
+    ordered = [col for col in LEADERBOARD_COLUMNS if col in leaderboard.columns]
+    extras = [col for col in leaderboard.columns if col not in ordered]
+    leaderboard = leaderboard[ordered + extras]
+
+    return leaderboard
 
 
 def select_best_model(
@@ -54,16 +77,16 @@ def select_best_model(
     Parameters
     ----------
     training_results:
-        Outputs from model training.
+        Full list of training outputs.
     leaderboard:
-        Sorted leaderboard.
+        Sorted leaderboard from ``create_leaderboard``.
 
     Returns
     -------
     TrainingResult
-        Top-ranked model result.
+        The top-ranked training result.
     """
-    best_model_name = leaderboard.iloc[0]["model"]
+    best_model_name = leaderboard.iloc[0]["model_name"]
     for result in training_results:
         if result.model_name == best_model_name:
             return result

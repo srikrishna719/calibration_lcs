@@ -11,15 +11,13 @@ import pandas as pd
 DataSource = Union[str, Path, BinaryIO, pd.DataFrame]
 
 
-def load_csv(source: DataSource, dataset_name: str) -> pd.DataFrame:
+def load_csv(source: DataSource) -> pd.DataFrame:
     """Load a CSV dataset or clone an existing DataFrame.
 
     Parameters
     ----------
     source:
         File path, file-like object, or DataFrame.
-    dataset_name:
-        Human-readable dataset name used in validation errors.
 
     Returns
     -------
@@ -28,9 +26,7 @@ def load_csv(source: DataSource, dataset_name: str) -> pd.DataFrame:
     """
     if isinstance(source, pd.DataFrame):
         return source.copy()
-
-    dataframe = pd.read_csv(source)
-    return dataframe.copy()
+    return pd.read_csv(source).copy()
 
 
 def validate_dataset(
@@ -38,70 +34,106 @@ def validate_dataset(
     timestamp_column: str,
     dataset_name: str,
 ) -> pd.DataFrame:
-    """Validate the expected structure and types of an input dataset.
+    """Validate required structure for an uploaded dataset.
 
     Parameters
     ----------
     dataframe:
         Dataset to validate.
     timestamp_column:
-        Name of the timestamp column expected in the dataset.
+        Name of the timestamp column.
     dataset_name:
-        Human-readable dataset name used in error messages.
+        Human-readable dataset name for error messages.
 
     Returns
     -------
     pd.DataFrame
-        Validated dataset with parsed timestamps.
+        Validated dataset.
     """
     if dataframe.empty:
         raise ValueError(f"{dataset_name} dataset is empty.")
-
     if timestamp_column not in dataframe.columns:
         raise ValueError(
             f"{dataset_name} dataset must contain timestamp column '{timestamp_column}'."
         )
 
-    validated = dataframe.copy()
-    validated[timestamp_column] = pd.to_datetime(
-        validated[timestamp_column],
-        errors="coerce",
-    )
+    numeric_columns = dataframe.select_dtypes(include="number").columns.tolist()
+    if not numeric_columns:
+        raise ValueError(f"{dataset_name} dataset must contain at least one numeric column.")
 
-    if validated[timestamp_column].isna().all():
+    return dataframe.copy()
+
+
+def parse_and_normalize_timestamps(
+    dataframe: pd.DataFrame,
+    timestamp_column: str,
+    timezone: str = "UTC",
+) -> pd.DataFrame:
+    """Convert timestamps to timezone-naive UTC-normalized datetimes.
+
+    Parameters
+    ----------
+    dataframe:
+        Dataset with a timestamp column.
+    timestamp_column:
+        Timestamp field to parse.
+    timezone:
+        Timezone assumed for naive timestamps before conversion to UTC.
+
+    Returns
+    -------
+    pd.DataFrame
+        Dataset with normalized timestamps.
+    """
+    transformed = dataframe.copy()
+    timestamps = pd.to_datetime(transformed[timestamp_column], errors="coerce")
+    if timestamps.isna().all():
         raise ValueError(
-            f"{dataset_name} dataset contains no valid timestamps in '{timestamp_column}'."
+            f"Dataset contains no valid timestamps in '{timestamp_column}'."
         )
 
-    validated = validated.dropna(subset=[timestamp_column]).sort_values(timestamp_column)
-    validated = validated.drop_duplicates(subset=[timestamp_column]).reset_index(drop=True)
-    return validated
+    if timestamps.dt.tz is None:
+        timestamps = timestamps.dt.tz_localize(timezone, ambiguous="NaT", nonexistent="shift_forward")
+
+    transformed[timestamp_column] = timestamps.dt.tz_convert("UTC").dt.tz_localize(None)
+    transformed = transformed.dropna(subset=[timestamp_column])
+    transformed = transformed.sort_values(timestamp_column)
+    transformed = transformed.drop_duplicates(subset=[timestamp_column]).reset_index(drop=True)
+    return transformed
 
 
 def load_and_validate_dataset(
     source: DataSource,
     timestamp_column: str,
     dataset_name: str,
+    timezone: str = "UTC",
 ) -> pd.DataFrame:
-    """Load and validate a dataset in one step.
+    """Load, validate, and normalize a dataset in one step.
 
     Parameters
     ----------
     source:
         File path, file-like object, or DataFrame.
     timestamp_column:
-        Name of the timestamp column expected in the dataset.
+        Timestamp field expected in the dataset.
     dataset_name:
-        Human-readable dataset name used in validation errors.
+        Human-readable dataset name.
+    timezone:
+        Assumed timezone for naive timestamps.
 
     Returns
     -------
     pd.DataFrame
-        Cleanly loaded dataset ready for downstream processing.
+        Cleanly loaded dataset.
     """
-    dataframe = load_csv(source=source, dataset_name=dataset_name)
-    return validate_dataset(
+    dataframe = load_csv(source)
+    validated = validate_dataset(
         dataframe=dataframe,
         timestamp_column=timestamp_column,
         dataset_name=dataset_name,
+    )
+    return parse_and_normalize_timestamps(
+        dataframe=validated,
+        timestamp_column=timestamp_column,
+        timezone=timezone,
     )

@@ -4,26 +4,32 @@ app:
 data:
   timestamp_column: timestamp
   target_column: pm25
+  timezone: UTC
   sensor_prefix: sensor
   reference_prefix: reference
 
 preprocessing:
-  missing_strategy: median
+  missing_strategy: interpolate_ffill
   outlier_method: iqr
-  outlier_multiplier: 1.5
-  normalization: standard
+  outlier_threshold: 1.5
 
 alignment:
-  resample_rule: 1H
+  resample_rule: 1h
   aggregation: mean
-  max_lag_steps: 6
+  max_lag_steps: 3
   lag_column: auto
+  merge_strategy: inner
 
 feature_engineering:
   enabled: true
   lag_steps: [1, 2, 3]
   rolling_windows: [3, 6]
+  rolling_std: true
   add_time_features: true
+  optional_columns:
+    - sensor_temperature
+    - sensor_humidity
+    - sensor_voc
 
 training:
   test_size: 0.2
@@ -32,22 +38,25 @@ training:
     - linear_regression
     - ridge
     - lasso
-    - elastic_net
     - random_forest
-    - gradient_boosting
-    - extra_trees
     - xgboost
   model_params:
     ridge:
       alpha: 1.0
+    lasso:
+      alpha: 0.01
     random_forest:
       n_estimators: 200
       max_depth: 10
     xgboost:
-      n_estimators: 300
-      max_depth: 5
+      n_estimators: 200
+      max_depth: 4
       learning_rate: 0.05
 
 evaluation:
   sort_by: rmse
   ascending: true
+
+drift_analysis:
+  rolling_window: 6
+  drift_threshold: 1.5

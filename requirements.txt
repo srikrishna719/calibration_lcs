@@ -5,3 +5,5 @@ xgboost
 plotly
 streamlit
 PyYAML
+scipy
+joblib

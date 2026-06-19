@@ -3,38 +3,27 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List
 
 import numpy as np
 import pandas as pd
-from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
 
 
 @dataclass
-class PreprocessingArtifacts:
-    """Artifacts captured during preprocessing."""
+class PreprocessingSummary:
+    """Summary information captured during preprocessing."""
 
-    imputer: SimpleImputer
-    scaler: StandardScaler | MinMaxScaler | None
+    original_rows: int
+    cleaned_rows: int
+    rows_removed_as_outliers: int
     numeric_columns: List[str]
 
 
-def get_numeric_columns(dataframe: pd.DataFrame, exclude: Iterable[str] | None = None) -> List[str]:
-    """Return numeric columns excluding any provided fields.
-
-    Parameters
-    ----------
-    dataframe:
-        Input dataset.
-    exclude:
-        Column names to omit.
-
-    Returns
-    -------
-    List[str]
-        Numeric column names.
-    """
+def get_numeric_columns(
+    dataframe: pd.DataFrame,
+    exclude: Iterable[str] | None = None,
+) -> List[str]:
+    """Return numeric columns excluding any provided fields."""
     excluded = set(exclude or [])
     return [
         column
@@ -43,110 +32,114 @@ def get_numeric_columns(dataframe: pd.DataFrame, exclude: Iterable[str] | None =
     ]
 
 
-def impute_missing_values(
+def clean_missing_values(
     dataframe: pd.DataFrame,
+    timestamp_column: str,
     numeric_columns: List[str],
-    strategy: str = "median",
-) -> Tuple[pd.DataFrame, SimpleImputer]:
-    """Fill missing numeric values using a configurable strategy.
+    method: str = "interpolate_ffill",
+) -> pd.DataFrame:
+    """Clean missing numeric values using the chosen strategy.
 
     Parameters
     ----------
     dataframe:
         Dataset to transform.
+    timestamp_column:
+        Timestamp field used to preserve ordering.
     numeric_columns:
-        Numeric columns to impute.
-    strategy:
-        Scikit-learn imputation strategy.
-
-    Returns
-    -------
-    Tuple[pd.DataFrame, SimpleImputer]
-        Imputed dataset and fitted imputer.
-    """
-    transformed = dataframe.copy()
-    imputer = SimpleImputer(strategy=strategy)
-
-    if numeric_columns:
-        transformed[numeric_columns] = imputer.fit_transform(transformed[numeric_columns])
-
-    return transformed, imputer
-
-
-def remove_outliers_iqr(
-    dataframe: pd.DataFrame,
-    numeric_columns: List[str],
-    multiplier: float = 1.5,
-) -> pd.DataFrame:
-    """Remove rows containing IQR-based outliers in numeric columns.
-
-    Parameters
-    ----------
-    dataframe:
-        Dataset to filter.
-    numeric_columns:
-        Numeric columns to inspect.
-    multiplier:
-        IQR multiplier that defines the acceptable bounds.
+        Numeric columns to clean.
+    method:
+        Missing-value strategy. One of:
+        - ``"interpolate_ffill"`` — linear interpolation, then ffill+bfill for any
+          remaining gaps (edges). Most robust; **recommended**.
+        - ``"interpolate"``      — linear interpolation only (no fill fallback).
+          May leave NaNs at the very start/end of the series.
+        - ``"ffill"``            — forward-fill (carry last known value forward),
+          then bfill for leading NaNs.
+        - ``"bfill"``            — backward-fill (use the next known value),
+          then ffill for trailing NaNs.
 
     Returns
     -------
     pd.DataFrame
-        Filtered dataset.
+        Dataset with cleaned missing values.
     """
+    transformed = dataframe.sort_values(timestamp_column).copy()
     if not numeric_columns:
-        return dataframe.copy()
+        return transformed
 
-    filtered = dataframe.copy()
-    mask = pd.Series(True, index=filtered.index)
+    if method == "interpolate_ffill":
+        transformed[numeric_columns] = transformed[numeric_columns].interpolate(
+            method="linear",
+            limit_direction="both",
+        )
+        transformed[numeric_columns] = transformed[numeric_columns].ffill().bfill()
+    elif method == "interpolate":
+        transformed[numeric_columns] = transformed[numeric_columns].interpolate(
+            method="linear",
+            limit_direction="both",
+        )
+    elif method == "ffill":
+        transformed[numeric_columns] = transformed[numeric_columns].ffill().bfill()
+    elif method == "bfill":
+        transformed[numeric_columns] = transformed[numeric_columns].bfill().ffill()
+    else:
+        raise ValueError(f"Unsupported missing value strategy '{method}'.")
 
-    for column in numeric_columns:
-        q1 = filtered[column].quantile(0.25)
-        q3 = filtered[column].quantile(0.75)
-        iqr = q3 - q1
-        lower = q1 - (multiplier * iqr)
-        upper = q3 + (multiplier * iqr)
-        mask &= filtered[column].between(lower, upper) | filtered[column].isna()
-
-    return filtered.loc[mask].reset_index(drop=True)
+    return transformed
 
 
-def normalize_features(
+def detect_outlier_mask_iqr(
     dataframe: pd.DataFrame,
     numeric_columns: List[str],
-    method: str = "standard",
-) -> Tuple[pd.DataFrame, StandardScaler | MinMaxScaler | None]:
-    """Normalize numeric columns with a selected scaler.
+    multiplier: float,
+) -> pd.Series:
+    """Create an IQR-based row mask for non-outlier observations."""
+    mask = pd.Series(True, index=dataframe.index)
+    for column in numeric_columns:
+        q1 = dataframe[column].quantile(0.25)
+        q3 = dataframe[column].quantile(0.75)
+        iqr = q3 - q1
+        lower = q1 - multiplier * iqr
+        upper = q3 + multiplier * iqr
+        mask &= dataframe[column].between(lower, upper) | dataframe[column].isna()
+    return mask
 
-    Parameters
-    ----------
-    dataframe:
-        Dataset to scale.
-    numeric_columns:
-        Numeric columns to normalize.
-    method:
-        Either `standard`, `minmax`, or `none`.
 
-    Returns
-    -------
-    Tuple[pd.DataFrame, StandardScaler | MinMaxScaler | None]
-        Scaled dataset and fitted scaler when applicable.
-    """
-    transformed = dataframe.copy()
-    scaler: StandardScaler | MinMaxScaler | None
+def detect_outlier_mask_zscore(
+    dataframe: pd.DataFrame,
+    numeric_columns: List[str],
+    threshold: float,
+) -> pd.Series:
+    """Create a z-score-based row mask for non-outlier observations."""
+    if not numeric_columns:
+        return pd.Series(True, index=dataframe.index)
 
+    values = dataframe[numeric_columns]
+    std = values.std(ddof=0).replace(0, np.nan)
+    zscores = ((values - values.mean()) / std).abs()
+    zscores = zscores.fillna(0)
+    return (zscores <= threshold).all(axis=1)
+
+
+def remove_outliers(
+    dataframe: pd.DataFrame,
+    numeric_columns: List[str],
+    method: str = "iqr",
+    threshold: float = 1.5,
+) -> pd.DataFrame:
+    """Remove outlier rows from numeric columns."""
     if not numeric_columns or method == "none":
-        return transformed, None
+        return dataframe.copy()
 
-    if method == "standard":
-        scaler = StandardScaler()
-    elif method == "minmax":
-        scaler = MinMaxScaler()
+    if method == "iqr":
+        mask = detect_outlier_mask_iqr(dataframe, numeric_columns, threshold)
+    elif method == "zscore":
+        mask = detect_outlier_mask_zscore(dataframe, numeric_columns, threshold)
     else:
-        raise ValueError(f"Unsupported normalization method '{method}'.")
+        raise ValueError(f"Unsupported outlier method '{method}'.")
 
-    transformed[numeric_columns] = scaler.fit_transform(transformed[numeric_columns])
-    return transformed, scaler
+    return dataframe.loc[mask].reset_index(drop=True)
 
 
 def preprocess_dataset(
@@ -154,52 +147,46 @@ def preprocess_dataset(
     timestamp_column: str,
     config: Dict[str, object],
     exclude_columns: Iterable[str] | None = None,
-) -> Tuple[pd.DataFrame, PreprocessingArtifacts]:
-    """Run the configured preprocessing pipeline on a dataset.
+) -> tuple[pd.DataFrame, PreprocessingSummary]:
+    """Run preprocessing for a single dataset.
 
     Parameters
     ----------
     dataframe:
         Dataset to preprocess.
     timestamp_column:
-        Timestamp field excluded from numeric transformations.
+        Timestamp field.
     config:
         Preprocessing settings.
     exclude_columns:
-        Columns excluded from numeric preprocessing, such as the training target.
+        Columns excluded from numeric preprocessing.
 
     Returns
     -------
-    Tuple[pd.DataFrame, PreprocessingArtifacts]
-        Preprocessed dataset and transformation artifacts.
+    tuple[pd.DataFrame, PreprocessingSummary]
+        Cleaned dataset and summary metadata.
     """
-    excluded_columns = [timestamp_column, *(exclude_columns or [])]
-    numeric_columns = get_numeric_columns(dataframe, exclude=excluded_columns)
-    transformed, imputer = impute_missing_values(
+    original_rows = len(dataframe)
+    numeric_columns = get_numeric_columns(
         dataframe=dataframe,
-        numeric_columns=numeric_columns,
-        strategy=str(config.get("missing_strategy", "median")),
+        exclude=[timestamp_column, *(exclude_columns or [])],
     )
-
-    outlier_method = str(config.get("outlier_method", "iqr"))
-    if outlier_method == "iqr":
-        transformed = remove_outliers_iqr(
-            dataframe=transformed,
-            numeric_columns=numeric_columns,
-            multiplier=float(config.get("outlier_multiplier", 1.5)),
-        )
-    elif outlier_method != "none":
-        raise ValueError(f"Unsupported outlier method '{outlier_method}'.")
-
-    transformed, scaler = normalize_features(
+    transformed = clean_missing_values(
+        dataframe=dataframe,
+        timestamp_column=timestamp_column,
+        numeric_columns=numeric_columns,
+        method=str(config.get("missing_strategy", "interpolate_ffill")),
+    )
+    transformed = remove_outliers(
         dataframe=transformed,
         numeric_columns=numeric_columns,
-        method=str(config.get("normalization", "standard")),
+        method=str(config.get("outlier_method", "iqr")),
+        threshold=float(config.get("outlier_threshold", 1.5)),
     )
-
-    artifacts = PreprocessingArtifacts(
-        imputer=imputer,
-        scaler=scaler,
+    summary = PreprocessingSummary(
+        original_rows=original_rows,
+        cleaned_rows=len(transformed),
+        rows_removed_as_outliers=max(0, original_rows - len(transformed)),
         numeric_columns=numeric_columns,
     )
-    return transformed, artifacts
+    return transformed, summary
