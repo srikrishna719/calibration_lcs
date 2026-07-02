@@ -7,3 +7,6 @@ streamlit
 PyYAML
 scipy
 joblib
+statsmodels
+kaleido
+fpdf2

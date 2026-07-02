@@ -6,6 +6,54 @@
 
 ---
 
+## v5.0 — Research-Oriented Calibration Workbench *(2026-06-19 → 2026-07-02)*
+
+**Theme**: Major pipeline restructuring — 13-step research-grade workbench with OLS regression (statsmodels), dedicated normalization/diagnostics steps, chart-level downloads, PDF reports, and full reproducibility via `project_run.json`.
+
+### New Features
+
+| # | Feature | Files |
+|---|---------|-------|
+| 1 | **13-step pipeline** — expanded from 9 steps with dedicated Variable Selection, Feature Engineering, Normalization, and Statistical Diagnostics steps | `ui/app.py` |
+| 2 | **OLS Regression via statsmodels** — full p-values, standard errors, t-statistics, coefficient table; `StatsmodelsOLSRegressor` sklearn-like wrapper | `models/train.py`, `models/model_registry.py` |
+| 3 | **3 validation methods** — TimeSeriesSplit (default), K-Fold, Holdout — researcher controls strategy | `models/train.py`, `ui/app.py` |
+| 4 | **Normalization step** — StandardScaler, MinMaxScaler, RobustScaler with before/after summary table | `modules/normalization.py` (NEW), `ui/app.py` |
+| 5 | **Statistical Diagnostics step** — VIF table, OLS coefficient table, Shapiro-Wilk normality test in 3 tabs | `modules/diagnostics.py` (NEW), `ui/app.py` |
+| 6 | **Download buttons on every chart and table** — PNG + source CSV for charts, CSV for tables | `modules/download_helpers.py` (NEW), `ui/app.py` |
+| 7 | **QQ Plot** in Residual Analysis — residuals vs normal distribution with reference line | `modules/drift_analysis.py`, `ui/app.py` |
+| 8 | **`project_run.json` export** — full provenance metadata for reproducibility | `modules/exporter.py`, `pipeline/run_pipeline.py` |
+| 9 | **PDF Model Summary Report** — downloadable report via `fpdf2` with metrics, features, config | `modules/exporter.py` |
+| 10 | **Sortable leaderboard** — sort-by dropdown + ascending toggle with smart defaults | `ui/app.py` |
+| 11 | **Model groups** — Statistical Models (OLS, MLR, Ridge, Lasso) and ML Models (RF, XGBoost) organized in UI | `models/model_registry.py`, `ui/app.py` |
+| 12 | **Modelling objective toggle** — Interpretability vs Prediction Accuracy (metadata-only, saved in exports) | `ui/app.py`, `modules/exporter.py` |
+| 13 | **3 new imputation strategies** — `none`, `drop`, `interpolate_bfill` added to preprocessing | `modules/preprocessing.py` |
+| 14 | **README as read-only** — editor removed, download-only | `ui/app.py` |
+
+### New Files
+- `modules/download_helpers.py` — chart/table download buttons
+- `modules/normalization.py` — dataset normalization with sklearn scalers
+- `modules/diagnostics.py` — VIF, coefficient table, Shapiro-Wilk
+
+### v5.0.1 — Code Review & Optimization *(2026-07-02)*
+- **Deprecated API migration**: replaced 50+ `use_container_width=True` → `width='stretch'` across `app.py` and `download_helpers.py`
+- **State reset consolidation**: `_reset_downstream()` helper replaces 5 inline loops
+- **Dead code removal**: unused `generate_time_series_cv_predictions()` removed from `train.py`
+- **Import cleanup**: removed unused `Tuple` from typing imports
+- **Zero deprecation warnings** in console after migration
+
+### Breaking Changes
+- `STEPS` array expanded from 9 → 13 items (dispatch table updated)
+- `TrainingResult` dataclass gains 7 new fields
+- `build_export_bundle()` returns expanded dict with `project_run_json` and `model_summary_pdf`
+- `use_container_width` parameter removed (now `width='stretch'`)
+
+### Dependencies Added
+- `statsmodels` — OLS regression, VIF computation
+- `kaleido` — Plotly PNG export
+- `fpdf2` — PDF report generation
+
+---
+
 ## v4.0 — UX & Transparency Release *(2026-06-13)*
 
 **Theme**: Scientific transparency, user guidance, and usability — inline help at every widget, full model explanations with formulas, expanded preprocessing options, smarter lag warnings, multi-model comparison, and several UI bug fixes.

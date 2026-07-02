@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sed -i '1502,1610d' ui/app.py)",
+      "Bash(sed -n '1498,1512p' ui/app.py)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''ui/app.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''OK syntax''\\)\")"
+    ]
+  }
+}

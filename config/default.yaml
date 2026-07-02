@@ -9,20 +9,28 @@ data:
   reference_prefix: reference
 
 preprocessing:
-  missing_strategy: interpolate_ffill
+  missing_strategy: linear_interpolation_forward_fill
   outlier_method: iqr
   outlier_threshold: 1.5
+  reference:
+    missing_strategy: linear_interpolation_forward_fill
+    outlier_method: none
+    outlier_threshold: 1.5
+  sensor:
+    missing_strategy: linear_interpolation_forward_fill
+    outlier_method: iqr
+    outlier_threshold: 1.5
 
 alignment:
   resample_rule: 1h
   aggregation: mean
-  max_lag_steps: 3
+  max_lag_steps: 0
   lag_column: auto
   merge_strategy: inner
 
 feature_engineering:
   enabled: true
-  lag_steps: [1, 2, 3]
+  lag_steps: []
   rolling_windows: [3, 6]
   rolling_std: true
   add_time_features: true
@@ -31,11 +39,22 @@ feature_engineering:
     - sensor_humidity
     - sensor_voc
 
+normalization:
+  method: none
+
+validation:
+  method: timeseriessplit
+
+modelling:
+  objective: null
+
 training:
   test_size: 0.2
   cross_validation_folds: 5
+  validation_method: timeseriessplit
   selected_models:
-    - linear_regression
+    - ols_regression
+    - multiple_linear_regression
     - ridge
     - lasso
     - random_forest
@@ -52,6 +71,7 @@ training:
       n_estimators: 200
       max_depth: 4
       learning_rate: 0.05
+  modelling_objective: null
 
 evaluation:
   sort_by: rmse

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 try:
     import yaml
@@ -29,8 +29,11 @@ from modules.exporter import (
     export_metadata_json_bytes,
     export_metrics_json_bytes,
     export_model_bytes,
+    export_model_summary_report_pdf,
+    export_project_run_json_bytes,
 )
 from modules.feature_engineering import engineer_features
+from modules.normalization import get_normalization_summary, normalize_dataset
 from modules.preprocessing import preprocess_dataset
 
 
@@ -98,22 +101,17 @@ def run_preprocessing_stage(
     sensor_df: Any,
     config: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Clean both datasets independently.
-
-    Respects ``config['preprocessing']['apply_to_reference']`` (bool, default
-    False) which controls whether outlier removal is applied to the reference
-    dataset.  Missing-value imputation is always applied to both.
-    """
+    """Clean the Reference and LCS datasets with independent settings."""
     data_cfg = config["data"]
     ts_col = str(data_cfg["timestamp_column"])
     target_col = str(data_cfg["target_column"])
 
     prep_cfg = config["preprocessing"]
-    apply_to_reference = bool(prep_cfg.get("apply_to_reference", False))
+    sensor_prep_cfg = dict(prep_cfg.get("sensor", prep_cfg))
+    ref_prep_cfg = dict(prep_cfg.get("reference", prep_cfg))
 
     # Build a reference-specific config — optionally disable outlier removal
-    ref_prep_cfg = dict(prep_cfg)
-    if not apply_to_reference:
+    if "reference" not in prep_cfg and not bool(prep_cfg.get("apply_to_reference", False)):
         ref_prep_cfg["outlier_method"] = "none"
 
     ref_clean, ref_summary = preprocess_dataset(
@@ -125,7 +123,7 @@ def run_preprocessing_stage(
     sen_clean, sen_summary = preprocess_dataset(
         dataframe=sensor_df,
         timestamp_column=ts_col,
-        config=prep_cfg,
+        config=sensor_prep_cfg,
     )
     return {
         "reference_processed": ref_clean,
@@ -216,6 +214,26 @@ def run_modeling_stage(
     if featured_df.empty:
         raise ValueError("Feature engineering removed all rows. Adjust lag or rolling settings.")
 
+    # Apply normalization if configured.
+    norm_cfg = config.get("normalization", {})
+    norm_method = str(norm_cfg.get("method", "none"))
+    scaler = None
+    normalization_outputs = None
+    if norm_method.strip().lower() != "none":
+        norm_cols = [c for c in featured_df.columns if c not in [ts_col, target_col]]
+        before_norm = featured_df.copy()
+        featured_df, scaler = normalize_dataset(
+            featured_df,
+            norm_cols,
+            norm_method,
+            return_scaler=True,
+        )
+        normalization_outputs = {
+            "method": norm_method,
+            "columns": norm_cols,
+            "summary": get_normalization_summary(before_norm, featured_df, norm_cols),
+        }
+
     results = train_models(
         dataframe=featured_df,
         target_column=target_col,
@@ -248,6 +266,85 @@ def run_modeling_stage(
         "best_model": best.model,
         "best_model_metrics": best.metrics,
         "calibrated_dataset": calibrated,
+        "scaler": scaler,
+        "normalization_outputs": normalization_outputs,
+    }
+
+
+def train_on_prepared_dataset(
+    prepared_df: Any,
+    target_column: str,
+    config: Dict[str, Any],
+    feature_subset: list | None = None,
+) -> Dict[str, Any]:
+    """Train models on an already-prepared dataset.
+
+    Unlike :func:`run_modeling_stage`, this helper assumes feature engineering
+    and normalization have already been applied upstream (via the dedicated UI
+    steps). It trains, ranks, and produces a calibrated dataset directly from
+    ``prepared_df`` without re-engineering or re-scaling, so the user's choices
+    in the Variable Selection / Feature Engineering / Normalization steps are
+    the single source of truth.
+
+    Parameters
+    ----------
+    prepared_df:
+        Fully prepared modelling dataset (features + timestamp + target).
+    target_column:
+        Name of the target column to calibrate against.
+    config:
+        Pipeline configuration dict.
+    feature_subset:
+        Optional list of feature columns to restrict training.
+
+    Returns
+    -------
+    Dict[str, Any]
+        Same keys as :func:`run_modeling_stage`.
+    """
+    ts_col = str(config["data"]["timestamp_column"])
+
+    if prepared_df is None or len(prepared_df) == 0:
+        raise ValueError("Prepared dataset is empty. Revisit the preparation steps.")
+    if target_column not in prepared_df.columns:
+        raise ValueError(
+            f"Target column '{target_column}' not found in the prepared dataset."
+        )
+
+    results = train_models(
+        dataframe=prepared_df,
+        target_column=target_column,
+        timestamp_column=ts_col,
+        config=config["training"],
+        random_state=int(config.get("app", {}).get("random_state", 42)),
+        feature_subset=feature_subset,
+    )
+    leaderboard = create_leaderboard(results, config["evaluation"])
+    best = select_best_model(results, leaderboard)
+
+    predictions = predict_with_model(
+        model=best.model,
+        dataframe=prepared_df,
+        target_column=target_column,
+        timestamp_column=ts_col,
+    )
+    calibrated = (
+        prepared_df[[ts_col, target_column]]
+        .merge(predictions, on=ts_col, how="left")
+        .rename(columns={target_column: "reference_value", "prediction": "calibrated_value"})
+    )
+
+    return {
+        "featured_data": prepared_df,
+        "training_results": {r.model_name: r for r in results},
+        "training_results_list": results,
+        "leaderboard": leaderboard,
+        "best_model_name": best.model_name,
+        "best_model": best.model,
+        "best_model_metrics": best.metrics,
+        "calibrated_dataset": calibrated,
+        "scaler": None,
+        "normalization_outputs": None,
     }
 
 
@@ -281,9 +378,13 @@ def build_export_bundle(
     metrics: Dict[str, Any],
     feature_names: list,
     config: Dict[str, Any],
+    coefficient_table: Any = None,
+    selected_target: Optional[str] = None,
+    selected_predictors: Optional[List[str]] = None,
+    modelling_objective: Optional[str] = None,
 ) -> Dict[str, bytes]:
     """Create exportable artefacts for the selected model."""
-    return {
+    bundle = {
         "calibrated_dataset_csv": export_dataframe_csv_bytes(calibrated_dataset),
         "model_pickle": export_model_bytes(selected_model),
         "metrics_json": export_metrics_json_bytes(metrics),
@@ -295,7 +396,28 @@ def build_export_bundle(
             metrics=metrics,
             config=config,
         ),
+        "project_run_json": export_project_run_json_bytes(
+            config=config,
+            selected_target=selected_target,
+            selected_predictors=selected_predictors,
+            model_names=[model_name],
+            metrics=metrics,
+            modelling_objective=modelling_objective,
+        ),
     }
+
+    # PDF report
+    pdf_bytes = export_model_summary_report_pdf(
+        model_name=model_name,
+        metrics=metrics,
+        feature_names=feature_names,
+        config=config,
+        coefficient_table=coefficient_table,
+    )
+    if pdf_bytes:
+        bundle["model_summary_pdf"] = pdf_bytes
+
+    return bundle
 
 
 # -----------------------------------------------------------------------

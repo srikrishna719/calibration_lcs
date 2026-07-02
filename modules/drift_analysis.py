@@ -160,6 +160,51 @@ def create_residual_histogram(predictions_df: pd.DataFrame) -> go.Figure:
     return fig
 
 
+def create_qq_plot(predictions_df: pd.DataFrame) -> go.Figure:
+    """Create a QQ (Quantile-Quantile) plot of residuals against a normal distribution."""
+    try:
+        from scipy import stats as scipy_stats
+    except ImportError:
+        fig = go.Figure()
+        fig.add_annotation(text="scipy is required for QQ plots", showarrow=False)
+        fig.update_layout(template="plotly_dark", title="QQ Plot — Unavailable")
+        return fig
+
+    residuals = np.asarray(predictions_df["predicted"] - predictions_df["actual"], dtype=float)
+    residuals = residuals[np.isfinite(residuals)]
+
+    if len(residuals) < 3:
+        fig = go.Figure()
+        fig.add_annotation(text="Not enough data for QQ plot", showarrow=False)
+        fig.update_layout(template="plotly_dark", title="QQ Plot")
+        return fig
+
+    (osm, osr), (slope, intercept, _) = scipy_stats.probplot(residuals, dist="norm")
+    theoretical_line = slope * osm + intercept
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=osm, y=osr,
+        mode="markers",
+        name="Residuals",
+        marker=dict(color="#8b5cf6", size=5, opacity=0.7),
+    ))
+    fig.add_trace(go.Scatter(
+        x=osm, y=theoretical_line,
+        mode="lines",
+        name="Normal Reference",
+        line=dict(color="#f59e0b", dash="dash", width=2),
+    ))
+    fig.update_layout(
+        title="QQ Plot — Residuals vs Normal Distribution",
+        xaxis_title="Theoretical Quantiles",
+        yaxis_title="Sample Quantiles",
+        template="plotly_dark",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+    )
+    return fig
+
+
 def create_predicted_vs_actual_figure(predictions_df: pd.DataFrame) -> go.Figure:
     """Scatter plot of predicted vs actual with a 1:1 reference line."""
     fig = go.Figure()

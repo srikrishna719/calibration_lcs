@@ -17,6 +17,64 @@ class PreprocessingSummary:
     cleaned_rows: int
     rows_removed_as_outliers: int
     numeric_columns: List[str]
+    percentage_removed: float = 0.0
+
+    @property
+    def rows_removed(self) -> int:
+        """Total rows removed by missing-value and outlier treatment."""
+        return max(0, self.original_rows - self.cleaned_rows)
+
+    @property
+    def rows_remaining(self) -> int:
+        """Rows remaining after preprocessing."""
+        return self.cleaned_rows
+
+
+_MISSING_STRATEGY_ALIASES = {
+    "no treatment": "none",
+    "none": "none",
+    "forward fill": "forward_fill",
+    "ffill": "forward_fill",
+    "backward fill": "backward_fill",
+    "bfill": "backward_fill",
+    "linear interpolation": "linear_interpolation",
+    "interpolate": "linear_interpolation",
+    "linear interpolation + forward fill": "linear_interpolation_forward_fill",
+    "interpolate_ffill": "linear_interpolation_forward_fill",
+    "interpolate ffill": "linear_interpolation_forward_fill",
+    "linear interpolation forward fill": "linear_interpolation_forward_fill",
+    "linear interpolation + backward fill": "linear_interpolation_backward_fill",
+    "interpolate_bfill": "linear_interpolation_backward_fill",
+    "interpolate bfill": "linear_interpolation_backward_fill",
+    "linear interpolation backward fill": "linear_interpolation_backward_fill",
+    "drop missing rows": "drop_missing_rows",
+    "drop": "drop_missing_rows",
+}
+
+_OUTLIER_METHOD_ALIASES = {
+    "none": "none",
+    "iqr": "iqr",
+    "i.q.r.": "iqr",
+    "z-score": "zscore",
+    "zscore": "zscore",
+    "z score": "zscore",
+}
+
+
+def _canonical_missing_strategy(method: str) -> str:
+    key = str(method).strip().lower().replace("_", " ")
+    if key not in _MISSING_STRATEGY_ALIASES:
+        raise ValueError(f"Unsupported missing value strategy '{method}'.")
+    return _MISSING_STRATEGY_ALIASES[key]
+
+
+def _canonical_outlier_method(method: str) -> str:
+    key = str(method).strip().lower().replace("_", "-")
+    if key not in _OUTLIER_METHOD_ALIASES:
+        key = key.replace("-", " ")
+    if key not in _OUTLIER_METHOD_ALIASES:
+        raise ValueError(f"Unsupported outlier method '{method}'.")
+    return _OUTLIER_METHOD_ALIASES[key]
 
 
 def get_numeric_columns(
@@ -36,7 +94,7 @@ def clean_missing_values(
     dataframe: pd.DataFrame,
     timestamp_column: str,
     numeric_columns: List[str],
-    method: str = "interpolate_ffill",
+    method: str = "linear_interpolation_forward_fill",
 ) -> pd.DataFrame:
     """Clean missing numeric values using the chosen strategy.
 
@@ -49,15 +107,10 @@ def clean_missing_values(
     numeric_columns:
         Numeric columns to clean.
     method:
-        Missing-value strategy. One of:
-        - ``"interpolate_ffill"`` — linear interpolation, then ffill+bfill for any
-          remaining gaps (edges). Most robust; **recommended**.
-        - ``"interpolate"``      — linear interpolation only (no fill fallback).
-          May leave NaNs at the very start/end of the series.
-        - ``"ffill"``            — forward-fill (carry last known value forward),
-          then bfill for leading NaNs.
-        - ``"bfill"``            — backward-fill (use the next known value),
-          then ffill for trailing NaNs.
+        Missing-value strategy. Supported options are No Treatment, Forward
+        Fill, Backward Fill, Linear Interpolation, Linear Interpolation +
+        Forward Fill, Linear Interpolation + Backward Fill, and Drop Missing
+        Rows. Stable internal aliases are also accepted.
 
     Returns
     -------
@@ -68,23 +121,33 @@ def clean_missing_values(
     if not numeric_columns:
         return transformed
 
-    if method == "interpolate_ffill":
+    method_key = _canonical_missing_strategy(method)
+
+    if method_key == "none":
+        return transformed
+    elif method_key == "drop_missing_rows":
+        return transformed.dropna(subset=numeric_columns).reset_index(drop=True)
+    elif method_key == "linear_interpolation_forward_fill":
         transformed[numeric_columns] = transformed[numeric_columns].interpolate(
             method="linear",
-            limit_direction="both",
+            limit_area="inside",
         )
-        transformed[numeric_columns] = transformed[numeric_columns].ffill().bfill()
-    elif method == "interpolate":
+        transformed[numeric_columns] = transformed[numeric_columns].ffill()
+    elif method_key == "linear_interpolation":
         transformed[numeric_columns] = transformed[numeric_columns].interpolate(
             method="linear",
-            limit_direction="both",
+            limit_area="inside",
         )
-    elif method == "ffill":
-        transformed[numeric_columns] = transformed[numeric_columns].ffill().bfill()
-    elif method == "bfill":
-        transformed[numeric_columns] = transformed[numeric_columns].bfill().ffill()
-    else:
-        raise ValueError(f"Unsupported missing value strategy '{method}'.")
+    elif method_key == "linear_interpolation_backward_fill":
+        transformed[numeric_columns] = transformed[numeric_columns].interpolate(
+            method="linear",
+            limit_area="inside",
+        )
+        transformed[numeric_columns] = transformed[numeric_columns].bfill()
+    elif method_key == "forward_fill":
+        transformed[numeric_columns] = transformed[numeric_columns].ffill()
+    elif method_key == "backward_fill":
+        transformed[numeric_columns] = transformed[numeric_columns].bfill()
 
     return transformed
 
@@ -129,15 +192,14 @@ def remove_outliers(
     threshold: float = 1.5,
 ) -> pd.DataFrame:
     """Remove outlier rows from numeric columns."""
-    if not numeric_columns or method == "none":
+    method_key = _canonical_outlier_method(method)
+    if not numeric_columns or method_key == "none":
         return dataframe.copy()
 
-    if method == "iqr":
+    if method_key == "iqr":
         mask = detect_outlier_mask_iqr(dataframe, numeric_columns, threshold)
-    elif method == "zscore":
+    elif method_key == "zscore":
         mask = detect_outlier_mask_zscore(dataframe, numeric_columns, threshold)
-    else:
-        raise ValueError(f"Unsupported outlier method '{method}'.")
 
     return dataframe.loc[mask].reset_index(drop=True)
 
@@ -175,8 +237,9 @@ def preprocess_dataset(
         dataframe=dataframe,
         timestamp_column=timestamp_column,
         numeric_columns=numeric_columns,
-        method=str(config.get("missing_strategy", "interpolate_ffill")),
+        method=str(config.get("missing_strategy", "linear_interpolation_forward_fill")),
     )
+    rows_after_missing = len(transformed)
     transformed = remove_outliers(
         dataframe=transformed,
         numeric_columns=numeric_columns,
@@ -186,7 +249,10 @@ def preprocess_dataset(
     summary = PreprocessingSummary(
         original_rows=original_rows,
         cleaned_rows=len(transformed),
-        rows_removed_as_outliers=max(0, original_rows - len(transformed)),
+        rows_removed_as_outliers=max(0, rows_after_missing - len(transformed)),
         numeric_columns=numeric_columns,
+        percentage_removed=round(
+            (max(0, original_rows - len(transformed)) / original_rows * 100) if original_rows > 0 else 0.0, 2
+        ),
     )
     return transformed, summary

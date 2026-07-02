@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -44,7 +44,17 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.predict import predict_with_model
-from modules.drift_analysis import generate_post_analysis_outputs
+from models.model_registry import MODEL_GROUPS, MODEL_DISPLAY_NAMES
+from modules.drift_analysis import (
+    create_predicted_vs_actual_figure,
+    create_qq_plot,
+    create_residual_histogram,
+    create_residual_vs_predicted_figure,
+    generate_post_analysis_outputs,
+)
+from modules.download_helpers import render_chart_download, render_df_download
+from modules.normalization import get_normalization_summary, normalize_dataset
+from modules.diagnostics import compute_vif, shapiro_wilk_test
 from modules.plots import (
     create_bland_altman_plot,
     create_multi_model_metrics_bar,
@@ -61,6 +71,7 @@ from pipeline.run_pipeline import (
     run_modeling_stage,
     run_post_analysis_stage,
     run_preprocessing_stage,
+    train_on_prepared_dataset,
 )
 
 # ---------------------------------------------------------------------------
@@ -76,17 +87,55 @@ STEPS = [
     "🧹 Preprocessing",
     "🔗 Alignment",
     "📊 EDA",
+    "🎯 Variable Selection",
+    "🧬 Feature Engineering",
+    "📏 Normalization",
     "🤖 Modelling",
-    "🏆 Results",
-    "🔬 Post-Analysis",
+    "✅ Validation & Results",
+    "📐 Statistical Diagnostics",
+    "🔬 Residual Analysis",
     "💾 Export",
     "📖 README",
 ]
 
 STEP_KEYS = [
     "upload", "preprocessing", "alignment", "eda",
-    "modelling", "results", "post_analysis", "export", "readme",
+    "variable_selection", "feature_engineering", "normalization",
+    "modelling", "validation_results", "statistical_diagnostics",
+    "residual_analysis", "export", "readme",
 ]
+
+# Preprocessing UI options (full display names mapped to backend aliases)
+MISSING_OPTIONS = [
+    "No Treatment",
+    "Forward Fill",
+    "Backward Fill",
+    "Linear Interpolation",
+    "Linear Interpolation + Forward Fill",
+    "Linear Interpolation + Backward Fill",
+    "Drop Missing Rows",
+]
+
+OUTLIER_OPTIONS = ["iqr", "zscore", "none"]
+
+# Maps internal/aliased missing-strategy keys back to the display labels above,
+# so a previously-saved config selects the right option in the selectbox.
+_INTERNAL_TO_DISPLAY = {
+    "none": "No Treatment",
+    "no treatment": "No Treatment",
+    "forward_fill": "Forward Fill",
+    "ffill": "Forward Fill",
+    "backward_fill": "Backward Fill",
+    "bfill": "Backward Fill",
+    "linear_interpolation": "Linear Interpolation",
+    "interpolate": "Linear Interpolation",
+    "linear_interpolation_forward_fill": "Linear Interpolation + Forward Fill",
+    "interpolate_ffill": "Linear Interpolation + Forward Fill",
+    "linear_interpolation_backward_fill": "Linear Interpolation + Backward Fill",
+    "interpolate_bfill": "Linear Interpolation + Backward Fill",
+    "drop_missing_rows": "Drop Missing Rows",
+    "drop": "Drop Missing Rows",
+}
 
 # ---------------------------------------------------------------------------
 # Premium CSS
@@ -301,6 +350,13 @@ section[data-testid="stSidebar"] .stRadio > label {
     overflow: visible;
     white-space: nowrap;
 }
+
+/* Compact download buttons */
+.stDownloadButton > button {
+    padding: 0.3rem 0.8rem;
+    font-size: 0.82rem;
+    min-height: 2rem;
+}
 </style>
 """
 
@@ -347,7 +403,7 @@ def render_metric_row(metrics: Dict[str, float], keys: List[str], labels: Option
     for col, key, label in zip(cols, keys, labels):
         val = metrics.get(key, float("nan"))
         if isinstance(val, float):
-            txt = f"{val:.4f}"
+            txt = f"{val:.2f}"
             # Color coding
             q = ""
             if key == "r2" or key == "pearson_r":
@@ -369,6 +425,77 @@ def section(title: str):
 
 def info_pill(text: str) -> str:
     return f'<span class="info-pill">{text}</span>'
+
+
+def _model_label(key: str) -> str:
+    """Human-readable label for a model registry key."""
+    return key.replace("_", " ").title()
+
+
+def _format_metric_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Round numeric columns to 2 decimal places for display."""
+    out = df.copy()
+    for col in out.select_dtypes(include=[np.number]).columns:
+        out[col] = out[col].round(2)
+    return out
+
+
+def _best_row_style(row: pd.Series) -> list:
+    """Highlight the best (rank 1) row in a leaderboard."""
+    if row.get("rank") == 1 or row.name == 0:
+        return ["background-color: rgba(16, 185, 129, 0.15)"] * len(row)
+    return [""] * len(row)
+
+
+def _format_coefficient_table(coef_table) -> pd.DataFrame:
+    """Format a coefficient table with proper decimal places."""
+    if coef_table is None or (isinstance(coef_table, pd.DataFrame) and coef_table.empty):
+        return pd.DataFrame(columns=["Variable", "Coefficient", "Std Error", "t-Statistic", "P-value"])
+    df = coef_table.copy()
+    for col in ["Coefficient", "Std Error", "t-Statistic"]:
+        if col in df.columns:
+            df[col] = df[col].round(2)
+    if "P-value" in df.columns:
+        df["P-value"] = df["P-value"].apply(lambda x: f"{x:.4f}" if isinstance(x, float) else x)
+    return df
+
+
+def _chart_customization(key_prefix: str, default_title: str, default_x: str, default_y: str):
+    """Render editable title/axis inputs and return (title, x_label, y_label)."""
+    with st.expander("\u2699\ufe0f Chart Customization", expanded=False):
+        title = st.text_input("Title", value=default_title, key=f"{key_prefix}_title")
+        c1, c2 = st.columns(2)
+        x_label = c1.text_input("X-axis label", value=default_x, key=f"{key_prefix}_x")
+        y_label = c2.text_input("Y-axis label", value=default_y, key=f"{key_prefix}_y")
+    return title, x_label, y_label
+
+
+def _display_chart_with_downloads(fig, source_df, key: str, filename_prefix: str):
+    """Display a Plotly chart with PNG and source-data CSV download buttons."""
+    st.plotly_chart(fig, width='stretch')
+    render_chart_download(fig, source_df, key=key, filename_prefix=filename_prefix)
+
+
+def _normalization_summary_tables(summary: pd.DataFrame):
+    """Split normalization summary into before/after display tables."""
+    before_cols = [c for c in summary.columns if c.startswith("before_") or c == "column"]
+    after_cols = [c for c in summary.columns if c.startswith("after_") or c == "column"]
+    before_tbl = summary[before_cols].copy() if before_cols else summary.copy()
+    after_tbl = summary[after_cols].copy() if after_cols else summary.copy()
+    return before_tbl, after_tbl
+
+
+def _parse_positive_int_list(text: str) -> list:
+    """Parse comma-separated positive integers."""
+    result = []
+    for part in text.split(","):
+        part = part.strip()
+        if part:
+            val = int(part)
+            if val <= 0:
+                raise ValueError(f"Expected positive integer, got {val}")
+            result.append(val)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -416,6 +543,14 @@ def cached_modeling(merged_df, cfg_text, feature_subset_json="null"):
     return run_modeling_stage(merged_df, json.loads(cfg_text), feature_subset=subset)
 
 
+@st.cache_data(show_spinner=False)
+def cached_train_prepared(prepared_df, target_column, cfg_text, feature_subset_json="null"):
+    subset = json.loads(feature_subset_json)
+    return train_on_prepared_dataset(
+        prepared_df, target_column, json.loads(cfg_text), feature_subset=subset
+    )
+
+
 # ---------------------------------------------------------------------------
 # Session state initialisation
 # ---------------------------------------------------------------------------
@@ -426,12 +561,19 @@ def init_state():
         "config": None,
         "input_label": None,
         "data_outputs": None,
+        "dropped_ref_cols": [],
+        "dropped_sen_cols": [],
         "preprocessing_outputs": None,
         "alignment_outputs": None,
         "eda_outputs": None,
         "modeling_outputs": None,
+        "selected_target": None,
+        "selected_predictors": None,
         "selected_model_name": None,
-        "post_analysis_outputs": None,
+        "variable_selection_outputs": None,
+        "feature_engineering_outputs": None,
+        "normalization_outputs": None,
+        "residual_analysis_outputs": None,
         "export_bundle": None,
         # Feature engineering extras
         "featured_preview": None,
@@ -442,6 +584,28 @@ def init_state():
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+
+
+
+def _reset_downstream(*keys: str):
+    """Nil-out downstream pipeline outputs so stale results aren't carried forward."""
+    for k in keys:
+        st.session_state[k] = None
+
+
+# Common downstream reset groups
+_DOWNSTREAM_FROM_UPLOAD = (
+    "preprocessing_outputs", "alignment_outputs", "eda_outputs",
+    "modeling_outputs", "post_analysis_outputs", "export_bundle",
+)
+_DOWNSTREAM_FROM_PREPROCESSING = (
+    "alignment_outputs", "eda_outputs", "modeling_outputs",
+    "post_analysis_outputs", "export_bundle",
+)
+_DOWNSTREAM_FROM_ALIGNMENT = (
+    "eda_outputs", "modeling_outputs", "post_analysis_outputs", "export_bundle",
+)
+_DOWNSTREAM_FROM_MODELING = ("post_analysis_outputs", "export_bundle")
 
 
 def step_nav() -> str:
@@ -534,9 +698,9 @@ def render_upload():
         r, s = cached_load_sample()
         c1, c2 = st.columns(2)
         c1.caption("Reference (first 10 rows)")
-        c1.dataframe(r.head(10), use_container_width=True)
+        c1.dataframe(r.head(10), width='stretch')
         c2.caption("LCS (first 10 rows)")
-        c2.dataframe(s.head(10), use_container_width=True)
+        c2.dataframe(s.head(10), width='stretch')
 
     # Config customisation
     with st.expander("⚙️ Data Configuration"):
@@ -579,7 +743,7 @@ def render_upload():
         config["data"]["target_column"] = target_col
         config["data"]["timezone"] = tz
 
-    if st.button("🚀 Load & Validate Data", key="run_upload", use_container_width=True,
+    if st.button("🚀 Load & Validate Data", key="run_upload", width='stretch',
                  help="Loads, parses and validates both CSV files. Any format errors will be shown below."):
         try:
             ref_src, sen_src, label = resolve_inputs(ref_file, sen_file, use_sample)
@@ -593,8 +757,7 @@ def render_upload():
             st.session_state.input_label = label
             st.session_state.data_outputs = data_out
             # Reset downstream
-            for k in ["preprocessing_outputs","alignment_outputs","eda_outputs","modeling_outputs","post_analysis_outputs","export_bundle"]:
-                st.session_state[k] = None
+            _reset_downstream(*_DOWNSTREAM_FROM_UPLOAD)
             st.success(f"✅ Data loaded successfully from **{label}**")
         except Exception as e:
             st.error(f"❌ {e}")
@@ -607,13 +770,54 @@ def render_upload():
         )
         st.markdown(pills, unsafe_allow_html=True)
 
+        ts_name = st.session_state.config["data"].get("timestamp_column", "timestamp")
+        target_name = st.session_state.config["data"].get("target_column", "pm25")
+
+        with st.expander("🗑️ Drop Unneeded Columns", expanded=False):
+            st.caption(
+                "Remove any columns you do not want carried into preprocessing and modelling "
+                "(e.g. duplicate channels, diagnostics, unused pollutants). "
+                "The timestamp column is always kept; the reference target column cannot be dropped."
+            )
+            ref_df = st.session_state.data_outputs["reference_raw"]
+            sen_df = st.session_state.data_outputs["sensor_raw"]
+            ref_options = [c for c in ref_df.columns if c not in (ts_name, target_name)]
+            sen_options = [c for c in sen_df.columns if c != ts_name]
+            dc1, dc2 = st.columns(2)
+            dropped_ref = dc1.multiselect(
+                "Reference columns to drop",
+                ref_options,
+                default=[c for c in st.session_state.dropped_ref_cols if c in ref_options],
+                key="drop_ref_cols",
+                help="Columns removed from the reference dataset before preprocessing.",
+            )
+            dropped_sen = dc2.multiselect(
+                "Sensor columns to drop",
+                sen_options,
+                default=[c for c in st.session_state.dropped_sen_cols if c in sen_options],
+                key="drop_sen_cols",
+                help="Columns removed from the sensor dataset before preprocessing.",
+            )
+            if st.button("Apply column drops", key="apply_drops", width='stretch'):
+                st.session_state.dropped_ref_cols = dropped_ref
+                st.session_state.dropped_sen_cols = dropped_sen
+                st.session_state.data_outputs["reference_raw"] = ref_df.drop(columns=dropped_ref, errors="ignore")
+                st.session_state.data_outputs["sensor_raw"] = sen_df.drop(columns=dropped_sen, errors="ignore")
+                _reset_downstream(*_DOWNSTREAM_FROM_UPLOAD)
+                st.success(f"✅ Dropped {len(dropped_ref)} reference and {len(dropped_sen)} sensor column(s)")
+                st.rerun()
+
         tab1, tab2 = st.tabs(["Reference Data", "Sensor Data"])
         with tab1:
-            st.dataframe(st.session_state.data_outputs["reference_raw"].head(20), use_container_width=True)
+            ref_preview = st.session_state.data_outputs["reference_raw"].head(20)
+            st.dataframe(ref_preview, width='stretch')
+            render_df_download(ref_preview, key="ref_preview_csv", filename="reference_preview.csv")
         with tab2:
-            st.dataframe(st.session_state.data_outputs["sensor_raw"].head(20), use_container_width=True)
+            sen_preview = st.session_state.data_outputs["sensor_raw"].head(20)
+            st.dataframe(sen_preview, width='stretch')
+            render_df_download(sen_preview, key="sen_preview_csv", filename="sensor_preview.csv")
 
-        if st.button("Next ➡️", key="next_upload", use_container_width=True):
+        if st.button("Next ➡️", key="next_upload", width='stretch'):
             go_next()
 
 
@@ -630,89 +834,95 @@ def render_preprocessing():
 
     config = st.session_state.config
 
-    with st.expander("⚙️ Sensor Data Preprocessing", expanded=True):
-        st.caption(
-            "Controls how the **sensor (LCS) data** is cleaned before alignment. "
-            "Missing values are filled first, then statistical outliers are removed."
-        )
+    st.caption(
+        "The **sensor (LCS)** and **reference** datasets are cleaned **independently** — "
+        "each has its own missing-value strategy and outlier settings. "
+        "Missing values are filled first, then outliers are removed."
+    )
+
+    def _preprocess_controls(cfg: dict, key_prefix: str, default_missing: str, default_outlier: str) -> dict:
         c1, c2, c3 = st.columns(3)
-        _MISSING_OPTIONS = ["interpolate_ffill", "interpolate", "ffill", "bfill"]
-        _cur_missing = str(config["preprocessing"].get("missing_strategy", "interpolate_ffill"))
-        _missing_idx = _MISSING_OPTIONS.index(_cur_missing) if _cur_missing in _MISSING_OPTIONS else 0
+        cur_missing = str(cfg.get("missing_strategy", default_missing))
+        cur_missing_label = _INTERNAL_TO_DISPLAY.get(cur_missing, cur_missing)
+        if cur_missing_label not in MISSING_OPTIONS:
+            cur_missing_label = default_missing
         missing_method = c1.selectbox(
             "Missing value strategy",
-            _MISSING_OPTIONS,
-            index=_missing_idx,
+            MISSING_OPTIONS,
+            index=MISSING_OPTIONS.index(cur_missing_label),
+            key=f"{key_prefix}_missing",
             help=(
-                "How to fill gaps (NaN) in the sensor data:\n\n"
-                "• **interpolate_ffill** *(recommended)* — linearly interpolates between known values, "
-                "then forward-fills/back-fills any remaining edge gaps. Most robust.\n"
-                "• **interpolate** — linear interpolation only. May leave NaNs at the very "
-                "start or end of the series if there is no surrounding data.\n"
-                "• **ffill** — copies the last known value forward (and back-fills leading gaps). "
-                "Good for step-like signals but can introduce flat periods.\n"
-                "• **bfill** — copies the next known value backward (and forward-fills trailing gaps). "
-                "Useful when future values are more reliable than past ones."
+                "How to fill gaps (NaN):\n\n"
+                "• **No Treatment** — leave gaps untouched.\n"
+                "• **Forward Fill** — copy the last known value forward.\n"
+                "• **Backward Fill** — copy the next known value backward.\n"
+                "• **Linear Interpolation** — interpolate between known values (edge gaps may remain).\n"
+                "• **Linear Interpolation + Forward Fill** *(recommended)* — interpolate then forward-fill edges.\n"
+                "• **Linear Interpolation + Backward Fill** — interpolate then back-fill edges.\n"
+                "• **Drop Missing Rows** — delete any row containing a missing numeric value."
             ),
         )
         outlier_method = c2.selectbox(
             "Outlier removal method",
-            ["iqr", "zscore", "none"],
-            index=["iqr", "zscore", "none"].index(str(config["preprocessing"].get("outlier_method", "iqr"))),
+            OUTLIER_OPTIONS,
+            index=OUTLIER_OPTIONS.index(str(cfg.get("outlier_method", default_outlier)))
+            if str(cfg.get("outlier_method", default_outlier)) in OUTLIER_OPTIONS else OUTLIER_OPTIONS.index(default_outlier),
+            key=f"{key_prefix}_outlier",
             help=(
-                "Statistical method used to flag and remove extreme sensor readings:\n\n"
-                "• **iqr** *(recommended)* — removes rows where any numeric column falls outside "
-                "Q1 − threshold×IQR or Q3 + threshold×IQR. Robust to non-normal distributions.\n"
-                "• **zscore** — removes rows whose z-score (standard deviations from the mean) "
-                "exceeds the threshold. Sensitive to outliers in small datasets.\n"
-                "• **none** — no outlier removal applied."
+                "Statistical method used to flag and remove extreme readings:\n\n"
+                "• **iqr** — outside Q1 − k×IQR or Q3 + k×IQR. Robust to non-normal data.\n"
+                "• **zscore** — beyond k standard deviations from the mean.\n"
+                "• **none** — no outlier removal (threshold disabled)."
             ),
         )
         outlier_threshold = c3.number_input(
             "Outlier threshold",
             min_value=0.5, max_value=10.0,
-            value=float(config["preprocessing"].get("outlier_threshold", 1.5)),
+            value=float(cfg.get("outlier_threshold", 1.5)),
             step=0.1,
+            key=f"{key_prefix}_threshold",
+            disabled=(outlier_method == "none"),
             help=(
-                "Sensitivity of the outlier detector.\n\n"
-                "• For **IQR**: multiplier applied to the interquartile range. "
-                "1.5 = standard box-plot rule; 3.0 = only extreme outliers removed.\n"
-                "• For **z-score**: maximum allowed standard deviations from the mean. "
-                "2.0 = ~5 % of data flagged; 3.0 = ~0.3 % flagged.\n"
-                "Lower values = more aggressive removal."
+                "Sensitivity of the outlier detector. Disabled when method is **none**.\n\n"
+                "• For **IQR**: multiplier on the interquartile range (1.5 = box-plot rule).\n"
+                "• For **z-score**: max allowed standard deviations from the mean."
             ),
         )
-        config["preprocessing"]["missing_strategy"] = missing_method
-        config["preprocessing"]["outlier_method"] = outlier_method
-        config["preprocessing"]["outlier_threshold"] = outlier_threshold
+        return {
+            "missing_strategy": missing_method,
+            "outlier_method": outlier_method,
+            "outlier_threshold": outlier_threshold,
+        }
+
+    prep_cfg = config.setdefault("preprocessing", {})
+    sensor_cfg = dict(prep_cfg.get("sensor", {}))
+    reference_cfg = dict(prep_cfg.get("reference", {}))
+
+    with st.expander("⚙️ Sensor (LCS) Data Preprocessing", expanded=True):
+        st.caption("Controls how the low-cost sensor data is cleaned before alignment.")
+        sensor_settings = _preprocess_controls(
+            sensor_cfg, "sensor_prep",
+            default_missing="Linear Interpolation + Forward Fill",
+            default_outlier="iqr",
+        )
 
     with st.expander("⚙️ Reference Data Preprocessing", expanded=False):
-        st.caption(
-            "Missing-value imputation is **always** applied to both datasets. "
-            "Toggle below to also apply outlier removal to the reference data. "
-            "The target column (e.g. reference PM2.5) is always protected from removal."
-        )
         st.info(
-            "💡 Reference instruments are high-accuracy devices — their readings should rarely "
-            "need outlier removal. Only enable this if you know your reference has sensor noise."
+            "💡 Reference instruments are high-accuracy devices — outlier removal is usually "
+            "unnecessary. The target column is always protected from removal."
         )
-        apply_to_ref = st.checkbox(
-            "Apply outlier removal to reference data",
-            value=bool(config["preprocessing"].get("apply_to_reference", False)),
-            key="apply_ref_outlier",
+        st.caption("Controls how the reference data is cleaned — fully independent of the sensor settings above.")
+        reference_settings = _preprocess_controls(
+            reference_cfg, "reference_prep",
+            default_missing="Linear Interpolation + Forward Fill",
+            default_outlier="none",
         )
-        config["preprocessing"]["apply_to_reference"] = apply_to_ref
-        if apply_to_ref:
-            st.info(
-                f"Outlier method **{outlier_method}** (threshold {outlier_threshold}) "
-                "will be applied to reference numeric columns (excluding the target column)."
-            )
-        else:
-            st.success("Reference outlier removal is **off** — recommended for most workflows.")
 
+    prep_cfg["sensor"] = sensor_settings
+    prep_cfg["reference"] = reference_settings
     st.session_state.config = config
 
-    if st.button("🚀 Run Preprocessing", key="run_preprocess", use_container_width=True):
+    if st.button("🚀 Run Preprocessing", key="run_preprocess", width='stretch'):
         with st.spinner("Cleaning datasets…"):
             try:
                 cfg_text = _cfg_to_json(config)
@@ -722,8 +932,7 @@ def render_preprocessing():
                     cfg_text,
                 )
                 st.session_state.preprocessing_outputs = outputs
-                for k in ["alignment_outputs","eda_outputs","modeling_outputs","post_analysis_outputs","export_bundle"]:
-                    st.session_state[k] = None
+                _reset_downstream(*_DOWNSTREAM_FROM_PREPROCESSING)
                 st.success("✅ Preprocessing completed")
             except Exception as e:
                 st.error(f"❌ {e}")
@@ -752,11 +961,13 @@ def render_preprocessing():
 
         tab1, tab2 = st.tabs(["Reference (cleaned)", "Sensor (cleaned)"])
         with tab1:
-            st.dataframe(out["reference_processed"].head(20), use_container_width=True)
+            st.dataframe(out["reference_processed"].head(20), width='stretch')
+            render_df_download(out["reference_processed"], key="ref_cleaned_csv", filename="reference_cleaned.csv")
         with tab2:
-            st.dataframe(out["sensor_processed"].head(20), use_container_width=True)
+            st.dataframe(out["sensor_processed"].head(20), width='stretch')
+            render_df_download(out["sensor_processed"], key="sen_cleaned_csv", filename="sensor_cleaned.csv")
 
-        if st.button("Next ➡️", key="next_preprocess", use_container_width=True):
+        if st.button("Next ➡️", key="next_preprocess", width='stretch'):
             go_next()
 
 
@@ -815,7 +1026,7 @@ def render_alignment():
         max_lag = c4.number_input(
             "Max lag steps",
             min_value=0, max_value=24,
-            value=int(config["alignment"].get("max_lag_steps", 3)),
+            value=int(config["alignment"].get("max_lag_steps", 0)),
             help=(
                 "The pipeline tests cross-correlation at offsets from −N to +N steps to "
                 "find the best time-shift between sensor and reference. "
@@ -829,7 +1040,7 @@ def render_alignment():
         config["alignment"]["max_lag_steps"] = max_lag
         st.session_state.config = config
 
-    if st.button("🚀 Run Alignment", key="run_alignment", use_container_width=True):
+    if st.button("🚀 Run Alignment", key="run_alignment", width='stretch'):
         with st.spinner("Aligning datasets…"):
             try:
                 cfg_text = _cfg_to_json(config)
@@ -839,8 +1050,7 @@ def render_alignment():
                     cfg_text,
                 )
                 st.session_state.alignment_outputs = outputs
-                for k in ["eda_outputs","modeling_outputs","post_analysis_outputs","export_bundle"]:
-                    st.session_state[k] = None
+                _reset_downstream(*_DOWNSTREAM_FROM_ALIGNMENT)
                 st.success("✅ Alignment completed")
             except Exception as e:
                 st.error(f"❌ {e}")
@@ -856,9 +1066,10 @@ def render_alignment():
             + info_pill(f"Lag column: {meta['lag_detection_column']}")
         )
         st.markdown(pills, unsafe_allow_html=True)
-        st.dataframe(out["merged_data"].head(20), use_container_width=True)
+        st.dataframe(out["merged_data"].head(20), width='stretch')
+        render_df_download(out["merged_data"], key="merged_data_csv", filename="merged_aligned_data.csv")
 
-        if st.button("Next ➡️", key="next_alignment", use_container_width=True):
+        if st.button("Next ➡️", key="next_alignment", width='stretch'):
             go_next()
 
 
@@ -874,7 +1085,7 @@ def render_eda():
 
     merged = st.session_state.alignment_outputs["merged_data"]
 
-    if st.button("🚀 Generate EDA", key="run_eda", use_container_width=True):
+    if st.button("🚀 Generate EDA", key="run_eda", width='stretch'):
         with st.spinner("Analysing data…"):
             try:
                 cfg_text = _cfg_to_json(st.session_state.config)
@@ -894,47 +1105,350 @@ def render_eda():
                 sel_col = st.selectbox("Select column", numeric_cols, key="eda_distcol")
                 from modules.eda import create_distribution_figure
                 fig = create_distribution_figure(merged, sel_col)
-                st.plotly_chart(fig, use_container_width=True)
+                title, x_label, y_label = _chart_customization(
+                    "eda_dist", f"Distribution of {sel_col}", sel_col, "Count"
+                )
+                fig.update_layout(title=title, xaxis_title=x_label, yaxis_title=y_label)
+                _display_chart_with_downloads(
+                    fig, merged[[sel_col]], key="eda_dist", filename_prefix="distribution"
+                )
             if "before_after_figure" in out:
-                st.plotly_chart(out["before_after_figure"], use_container_width=True)
+                _display_chart_with_downloads(
+                    out["before_after_figure"], None, key="eda_before_after",
+                    filename_prefix="before_after",
+                )
 
         with tabs[1]:
-            st.plotly_chart(out["correlation_figure"], use_container_width=True)
+            corr_source = merged.select_dtypes(include=[np.number]).corr().reset_index()
+            _display_chart_with_downloads(
+                out["correlation_figure"], corr_source,
+                key="eda_corr", filename_prefix="correlation_heatmap",
+            )
 
         with tabs[2]:
-            st.plotly_chart(out["missing_heatmap"], use_container_width=True)
-            st.dataframe(out["missing_summary"], use_container_width=True)
+            _display_chart_with_downloads(
+                out["missing_heatmap"], out.get("missing_summary"),
+                key="eda_missing", filename_prefix="missing_heatmap",
+            )
+            st.dataframe(out["missing_summary"], width='stretch')
+            render_df_download(out["missing_summary"], key="eda_missing_csv", filename="missing_summary.csv")
 
         with tabs[3]:
-            st.plotly_chart(out["time_series_figure"], use_container_width=True)
+            _display_chart_with_downloads(
+                out["time_series_figure"], merged, key="eda_ts", filename_prefix="time_series",
+            )
 
         with tabs[4]:
-            st.plotly_chart(out["anomaly_figure"], use_container_width=True)
+            _display_chart_with_downloads(
+                out["anomaly_figure"], out.get("anomalies"), key="eda_anomaly",
+                filename_prefix="anomalies",
+            )
             if not out["anomalies"].empty:
                 st.caption(f"Detected {len(out['anomalies'])} anomalous rows")
-                st.dataframe(out["anomalies"].head(25), use_container_width=True)
+                st.dataframe(out["anomalies"].head(25), width='stretch')
+                render_df_download(out["anomalies"], key="eda_anomalies_csv", filename="anomalies.csv")
             else:
                 st.success("No anomalies detected.")
 
-        if st.button("Next ➡️", key="next_eda", use_container_width=True):
+        if st.button("Next ➡️", key="next_eda", width='stretch'):
             go_next()
 
 
+
+
 # ---------------------------------------------------------------------------
-# STEP 5: Modelling
+# STEP 5: Variable Selection
 # ---------------------------------------------------------------------------
 
-def render_modelling():
-    st.subheader("🤖 Modelling")
+def render_variable_selection():
+    st.subheader("🎯 Variable Selection")
     if st.session_state.alignment_outputs is None or st.session_state.config is None:
         st.info("Complete the **Alignment** step first.")
         return
 
     config = st.session_state.config
     merged = st.session_state.alignment_outputs["merged_data"]
-    numeric_merged_cols = merged.select_dtypes(include="number").columns.tolist()
-    target_col_full = f"{config['data']['reference_prefix']}_{config['data']['target_column']}"
-    sensor_base_cols = [c for c in numeric_merged_cols if c != target_col_full]
+    ts_col = config["data"]["timestamp_column"]
+
+    numeric_cols = [c for c in merged.select_dtypes(include=[np.number]).columns if c != ts_col]
+    if not numeric_cols:
+        st.error("No numeric columns available for variable selection.")
+        return
+
+    st.markdown("Select the **target** (reference) variable and **predictor** (sensor) variables.")
+
+    target = st.selectbox(
+        "Target variable (what you are calibrating against)",
+        numeric_cols,
+        index=0,
+        key="var_sel_target",
+        help="The reference measurement column that the model should predict.",
+    )
+
+    predictor_options = [c for c in numeric_cols if c != target]
+    default_predictors = [c for c in predictor_options if c in (st.session_state.selected_predictors or predictor_options)]
+    predictors = st.multiselect(
+        "Predictor variables (sensor features)",
+        predictor_options,
+        default=default_predictors or predictor_options,
+        key="var_sel_predictors",
+        help="The sensor columns used as inputs to the calibration model.",
+    )
+
+    if not predictors:
+        st.warning("Select at least one predictor variable.")
+        return
+
+    modelling_df = merged[[ts_col, target] + predictors].copy()
+    st.session_state.selected_target = target
+    st.session_state.selected_predictors = predictors
+    st.session_state.variable_selection_outputs = {"modelling_dataset": modelling_df}
+
+    c1, c2 = st.columns(2)
+    c1.metric("Rows", f"{len(modelling_df):,}")
+    c2.metric("Columns", f"{len(modelling_df.columns):,}")
+    st.dataframe(modelling_df.head(20), width='stretch')
+
+    render_df_download(modelling_df, key="var_sel_dataset_csv", filename="modelling_dataset.csv")
+
+    if st.button("Next \u27a1\ufe0f", key="next_variable_selection", width='stretch'):
+        go_next()
+
+
+# ---------------------------------------------------------------------------
+# STEP 6: Feature Engineering
+# ---------------------------------------------------------------------------
+
+def render_feature_engineering():
+    st.subheader("\U0001f9ec Feature Engineering")
+    if st.session_state.variable_selection_outputs is None or st.session_state.config is None:
+        st.info("Complete the **Variable Selection** step first.")
+        return
+
+    config = st.session_state.config
+    modelling_df = st.session_state.variable_selection_outputs["modelling_dataset"]
+    ts_col = config["data"]["timestamp_column"]
+    target_col = st.session_state.selected_target
+    sensor_base_cols = [c for c in modelling_df.columns if c not in [ts_col, target_col]]
+
+    st.markdown(
+        info_pill(f"Rows: {len(modelling_df)}")
+        + info_pill(f"Base features: {len(sensor_base_cols)}")
+        + info_pill(f"Target: {target_col}"),
+        unsafe_allow_html=True,
+    )
+
+    fe_config = config.setdefault("feature_engineering", {})
+
+    with st.expander("\u23f3 Lag Features", expanded=False):
+        lag_steps_str = st.text_input(
+            "Lag steps (comma-separated)",
+            value=",".join(str(s) for s in fe_config.get("lag_steps", [1, 2, 3])),
+            key="fe_lag_steps",
+            help="Integers representing how many time-steps back to look.",
+        )
+        rolling_str = st.text_input(
+            "Rolling windows (comma-separated)",
+            value=",".join(str(w) for w in fe_config.get("rolling_windows", [3, 6])),
+            key="fe_rolling_windows",
+            help="Window sizes for rolling mean/std.",
+        )
+        rolling_std = st.checkbox(
+            "Include rolling std",
+            value=bool(fe_config.get("rolling_std", True)),
+            key="fe_rolling_std",
+        )
+        try:
+            fe_config["lag_steps"] = _parse_positive_int_list(lag_steps_str)
+        except ValueError:
+            st.warning("Invalid lag steps.")
+        try:
+            fe_config["rolling_windows"] = _parse_positive_int_list(rolling_str)
+        except ValueError:
+            st.warning("Invalid rolling windows.")
+        fe_config["rolling_std"] = rolling_std
+
+    with st.expander("\U0001f4d0 Polynomial & Interaction Features", expanded=False):
+        poly_degree = st.selectbox(
+            "Polynomial degree", [1, 2, 3],
+            index=[1, 2, 3].index(int(fe_config.get("polynomial_degree", 1))),
+            key="fe_poly_degree",
+        )
+        poly_cols = st.multiselect(
+            "Columns for polynomial expansion",
+            sensor_base_cols,
+            default=[c for c in fe_config.get("polynomial_columns", []) if c in sensor_base_cols],
+            key="fe_poly_cols",
+        )
+        interaction_cols = st.multiselect(
+            "Columns for pairwise interaction",
+            sensor_base_cols,
+            default=[c for c in fe_config.get("interaction_columns", []) if c in sensor_base_cols],
+            key="fe_interaction_cols",
+        )
+        fe_config["polynomial_degree"] = poly_degree
+        fe_config["polynomial_columns"] = poly_cols
+        fe_config["interaction_columns"] = interaction_cols
+
+    with st.expander("\u23f0 Time Features", expanded=False):
+        existing_tf = fe_config.get("time_feature_flags", {})
+        add_time = st.checkbox(
+            "Enable time features",
+            value=bool(fe_config.get("add_time_features", True)),
+            key="fe_add_time",
+            help="Adds hour-of-day, day-of-week, and day-of-month columns automatically. Extra features below are optional.",
+        )
+        fe_config["add_time_features"] = add_time
+        if add_time:
+            st.caption("Basic features (hour 0-23, day-of-week 0-6, day-of-month 1-31) always included. Enable extras:")
+            tc1, tc2, tc3 = st.columns(3)
+            tf = {"hour_of_day": True, "day_of_week": True, "day_of_month": True}
+            tf["unix_timestamp"] = tc1.checkbox("Unix timestamp", value=existing_tf.get("unix_timestamp", False), key="fe_tf_unix",
+                help="Seconds since 1970-01-01. Useful as a linear time trend proxy for tree models.")
+            tf["julian_date"] = tc1.checkbox("Julian date (DOY)", value=existing_tf.get("julian_date", False), key="fe_tf_julian",
+                help="Day-of-year (1-366). Captures seasonal variation without cyclical encoding.")
+            tf["calendar_date"] = tc1.checkbox("Calendar date (int)", value=existing_tf.get("calendar_date", False), key="fe_tf_caldate",
+                help="Integer days since 1970-01-01, day-resolution. Good for long-term trend.")
+            tf["cyclical_hour"] = tc2.checkbox("Cyclical hour sin/cos", value=existing_tf.get("cyclical_hour", False), key="fe_tf_cychour",
+                help="Encodes hour as sin/cos so hour 23 is treated as close to hour 0. Better than raw integer for linear models.")
+            tf["cyclical_dow"] = tc2.checkbox("Cyclical DOW sin/cos", value=existing_tf.get("cyclical_dow", False), key="fe_tf_cydow",
+                help="Circular day-of-week encoding. Sunday wraps around to Monday correctly.")
+            tf["cyclical_doy"] = tc2.checkbox("Cyclical DOY sin/cos", value=existing_tf.get("cyclical_doy", False), key="fe_tf_cydoy",
+                help="Circular day-of-year encoding. Dec 31 treated as adjacent to Jan 1.")
+            tf["season"] = tc3.checkbox("Season (DJF/MAM/JJA/SON)", value=existing_tf.get("season", False), key="fe_tf_season",
+                help="Meteorological season as 0-3: DJF(winter)=0, MAM(spring)=1, JJA(summer)=2, SON(autumn)=3.")
+            tf["day_name"] = tc3.checkbox("Day name & weekend flag", value=existing_tf.get("day_name", False), key="fe_tf_dayname",
+                help="Adds day-of-week number (0-6) and binary is_weekend (1=Sat/Sun). Traffic-related PM differs on weekends.")
+            fe_config["time_feature_flags"] = tf
+
+    st.session_state.config = config
+
+    if st.button("\U0001f680 Preview Features", key="preview_features", width='stretch'):
+        with st.spinner("Engineering features..."):
+            try:
+                from modules.feature_engineering import engineer_features
+                featured = engineer_features(
+                    dataframe=modelling_df,
+                    timestamp_column=ts_col,
+                    target_column=target_col,
+                    config=fe_config,
+                )
+                st.session_state.feature_engineering_outputs = {"featured_dataset": featured}
+                st.session_state.featured_preview = featured
+                st.success(f"\u2705 Features created: {len(featured.columns) - 2} features, {len(featured)} rows")
+            except Exception as e:
+                st.error(f"\u274c {e}")
+
+    fe_out = st.session_state.feature_engineering_outputs
+    if fe_out is not None:
+        featured = fe_out["featured_dataset"]
+        st.dataframe(featured.head(20), width='stretch')
+        render_df_download(featured, key="fe_dataset_csv", filename="featured_dataset.csv")
+
+    if st.button("Next \u27a1\ufe0f", key="next_feature_engineering", width='stretch',
+                 disabled=(st.session_state.feature_engineering_outputs is None)):
+        go_next()
+
+
+# ---------------------------------------------------------------------------
+# STEP 7: Normalization
+# ---------------------------------------------------------------------------
+
+def render_normalization():
+    st.subheader("\U0001f4cf Normalization")
+    if st.session_state.feature_engineering_outputs is None or st.session_state.config is None:
+        st.info("Complete the **Feature Engineering** step first.")
+        return
+
+    config = st.session_state.config
+    featured = st.session_state.feature_engineering_outputs["featured_dataset"]
+    ts_col = config["data"]["timestamp_column"]
+    target_col = st.session_state.selected_target
+
+    norm_methods = {"None": "none", "StandardScaler": "standard", "MinMaxScaler": "minmax", "RobustScaler": "robust"}
+    current = config.get("normalization", {}).get("method", "none")
+    current_label = {v: k for k, v in norm_methods.items()}.get(current, "None")
+
+    method_label = st.selectbox(
+        "Normalization method",
+        list(norm_methods.keys()),
+        index=list(norm_methods.keys()).index(current_label),
+        key="norm_method",
+        help="StandardScaler: zero mean, unit variance. MinMaxScaler: [0,1] range. RobustScaler: robust to outliers.",
+    )
+    method = norm_methods[method_label]
+    config.setdefault("normalization", {})["method"] = method
+    st.session_state.config = config
+
+    if st.button("\U0001f680 Apply Normalization", key="apply_normalization", width='stretch'):
+        with st.spinner("Normalizing..."):
+            try:
+                norm_cols = [c for c in featured.columns if c not in [ts_col, target_col]]
+                if method == "none":
+                    normalized = featured.copy()
+                    summary = get_normalization_summary(featured, featured, norm_cols)
+                else:
+                    before = featured.copy()
+                    normalized = normalize_dataset(featured.copy(), norm_cols, method)
+                    summary = get_normalization_summary(before, normalized, norm_cols)
+
+                st.session_state.normalization_outputs = {
+                    "normalized_dataset": normalized,
+                    "method": method,
+                    "summary": summary,
+                }
+                st.success(f"\u2705 Normalization applied: {method_label}")
+            except Exception as e:
+                st.error(f"\u274c {e}")
+
+    norm_out = st.session_state.normalization_outputs
+    if norm_out is not None:
+        normalized = norm_out["normalized_dataset"]
+        summary = norm_out["summary"]
+
+        if not summary.empty:
+            before_tbl, after_tbl = _normalization_summary_tables(summary)
+            t1, t2 = st.tabs(["Before", "After"])
+            with t1:
+                st.dataframe(before_tbl, width='stretch')
+                render_df_download(before_tbl, key="norm_before_csv", filename="normalization_before.csv")
+            with t2:
+                st.dataframe(after_tbl, width='stretch')
+                render_df_download(after_tbl, key="norm_after_csv", filename="normalization_after.csv")
+
+        st.dataframe(normalized.head(20), width='stretch')
+        render_df_download(normalized, key="norm_dataset_csv", filename="normalized_dataset.csv")
+
+    if st.button("Next \u27a1\ufe0f", key="next_normalization", width='stretch',
+                 disabled=(st.session_state.normalization_outputs is None)):
+        go_next()
+
+
+# ---------------------------------------------------------------------------
+# STEP 8: Modelling (updated prerequisites)
+# ---------------------------------------------------------------------------
+def render_modelling():
+    st.subheader("🤖 Modelling")
+    if st.session_state.normalization_outputs is None or st.session_state.config is None:
+        st.info("Complete the **Normalization** step first.")
+        return
+
+    config = st.session_state.config
+    model_df = st.session_state.normalization_outputs["normalized_dataset"]
+    ts_col = config["data"]["timestamp_column"]
+    target_col = st.session_state.selected_target
+    if target_col is None or target_col not in model_df.columns:
+        st.error("Target variable not found. Revisit the **Variable Selection** step.")
+        return
+    numeric_cols = model_df.select_dtypes(include="number").columns.tolist()
+    sensor_base_cols = [c for c in numeric_cols if c != target_col]
+
+    st.markdown(
+        info_pill(f"Rows: {len(model_df)}")
+        + info_pill(f"Features: {len(sensor_base_cols)}")
+        + info_pill(f"Target: {target_col}"),
+        unsafe_allow_html=True,
+    )
 
     # ---- Model Reference Guide ----
     with st.expander("📚 Model Reference Guide — How Each Model Works", expanded=False):
@@ -1136,150 +1650,6 @@ def render_modelling():
                 "> Auto-tuning searches: n_estimators, max_depth, learning_rate, subsample, colsample_bytree, reg_alpha, reg_lambda."
             )
 
-    with st.expander("⚙️ Lag & Rolling Features", expanded=False):
-        st.caption(
-            "💡 **What are lag features?** A lag feature copies the value of a sensor column from "
-            "N time-steps *in the past* and gives it to the model as a new input. "
-            "This lets the model learn from recent history — useful when pollution levels "
-            "from the previous hour(s) help predict the current reading.\n\n"
-            "**Example (hourly data):** lag = 1 means ‘reading 1 hour ago’, lag = 2 means ‘reading 2 hours ago’. "
-            "For air quality, lags of 1–2 time-steps are usually most meaningful. "
-            "Larger lags (e.g. 6+) rarely help and waste data because `dropna()` removes "
-            "the first N rows after lagging."
-        )
-        c1, c2, c3 = st.columns(3)
-        lag_steps_str = c1.text_input(
-            "Lag steps (comma-separated)",
-            value=",".join(str(s) for s in config["feature_engineering"].get("lag_steps", [1, 2, 3])),
-            help=(
-                "Integers representing how many time-steps back to look.\n\n"
-                "For **hourly data**: ‘1’ = 1h ago, ‘3’ = 3h ago.\n"
-                "For **5-min data**: ‘1’ = 5 min ago, ‘6’ = 30 min ago.\n\n"
-                "⚠️ **Air quality tip**: lags of 3+ hours are usually meaningless for PM2.5 "
-                "calibration — pollution events don’t persist that long in most settings. "
-                "Start with ‘1,2’ and add more only if you see improvement in R².\n\n"
-                "⚠️ Each lag step removes one row from the top of the dataset via dropna(). "
-                "On short datasets (< 200 rows) keep lags small (1–2)."
-            ),
-        )
-        rolling_str = c2.text_input(
-            "Rolling windows (comma-separated)",
-            value=",".join(str(w) for w in config["feature_engineering"].get("rolling_windows", [3, 6])),
-            help=(
-                "Window sizes for the rolling mean (and optionally std). "
-                "A window of 3 with hourly data gives a 3-hour moving average of the sensor.\n\n"
-                "Rolling mean smooths out short spikes and captures trend. "
-                "Rolling std measures how variable the sensor has been recently (useful for "
-                "detecting unstable conditions).\n\n"
-                "Good starting point: ‘3,6’ (short and medium-term smoothing)."
-            ),
-        )
-        rolling_std = c3.checkbox(
-            "Include rolling std",
-            value=bool(config["feature_engineering"].get("rolling_std", True)),
-            help=(
-                "Also create rolling standard deviation columns (in addition to rolling mean). "
-                "Rolling std captures sensor volatility over the window — a high std means "
-                "the sensor was fluctuating a lot recently, which may affect calibration accuracy."
-            ),
-        )
-        try:
-            parsed_lags = [int(x.strip()) for x in lag_steps_str.split(",") if x.strip()]
-            config["feature_engineering"]["lag_steps"] = parsed_lags
-            # Warn if large lags on a small dataset
-            n_rows = len(merged)
-            max_lag_val = max(parsed_lags) if parsed_lags else 0
-            if max_lag_val > 0 and n_rows < max_lag_val * 20:
-                st.warning(
-                    f"⚠️ Your merged dataset has **{n_rows} rows** and your largest lag is **{max_lag_val}**. "
-                    f"After lagging and dropping NaNs, you may lose a significant portion of your data. "
-                    f"Consider reducing lag steps or using a finer resample frequency."
-                )
-        except ValueError:
-            st.warning("Invalid lag steps — enter integers separated by commas, e.g. `1,2`.")
-        try:
-            config["feature_engineering"]["rolling_windows"] = [int(x.strip()) for x in rolling_str.split(",") if x.strip()]
-        except ValueError:
-            st.warning("Invalid rolling windows — enter integers separated by commas, e.g. `3,6`.")
-        config["feature_engineering"]["rolling_std"] = rolling_std
-
-    with st.expander("⚙️ Polynomial & Interaction Features", expanded=False):
-        st.caption(
-            "Creates non-linear versions of your sensor columns so that linear models "
-            "(Ridge, Lasso) can fit curved relationships. Tree-based models (RF, XGBoost) "
-            "don’t usually benefit from these, but they won’t hurt either."
-        )
-        poly_degree = st.selectbox(
-            "Polynomial degree",
-            [1, 2, 3],
-            index=[1,2,3].index(int(config["feature_engineering"].get("polynomial_degree", 1))),
-            help=(
-                "• **1** — no expansion (columns are used as-is).\n"
-                "• **2** — adds squared terms (col²) and pairwise products (col_a × col_b) "
-                "for all selected columns. Good for capturing gentle curves.\n"
-                "• **3** — adds cubic terms too. Powerful but risks overfitting on small datasets. "
-                "Use with regularised models (Ridge/Lasso) if degree 3."
-            ),
-        )
-        poly_cols = st.multiselect(
-            "Columns for polynomial expansion",
-            options=sensor_base_cols,
-            default=[c for c in config["feature_engineering"].get("polynomial_columns", []) if c in sensor_base_cols],
-            help=(
-                "Pick which sensor columns to expand into polynomial features. "
-                "Applying to all columns at once can create a very large feature space — "
-                "select only the most important 1–3 columns (e.g. main PM or humidity channel)."
-            ),
-        )
-        interaction_cols = st.multiselect(
-            "Columns for pairwise interaction terms",
-            options=sensor_base_cols,
-            default=[c for c in config["feature_engineering"].get("interaction_columns", []) if c in sensor_base_cols],
-            help=(
-                "Creates col_i × col_j for every pair in the selection. "
-                "Useful when you believe two variables interact (e.g. PM × humidity for "
-                "hygroscopic correction). Selecting N columns creates N×(N-1)/2 new features."
-            ),
-        )
-        config["feature_engineering"]["polynomial_degree"] = poly_degree
-        config["feature_engineering"]["polynomial_columns"] = poly_cols
-        config["feature_engineering"]["interaction_columns"] = interaction_cols
-
-    with st.expander("⚙️ Time & Date Features", expanded=False):
-        st.caption(
-            "Adds date/time-derived columns to help models capture diurnal cycles and seasonal patterns. "
-            "Air quality often has strong time-of-day and day-of-week patterns "
-            "(e.g. traffic peaks, cooking, industrial schedules)."
-        )
-        existing_tf = config["feature_engineering"].get("time_feature_flags", {})
-        add_time = st.checkbox(
-            "Enable time features",
-            value=bool(config["feature_engineering"].get("add_time_features", True)),
-            help="Adds hour-of-day, day-of-week, and day-of-month columns automatically. Extra features below are optional.",
-        )
-        config["feature_engineering"]["add_time_features"] = add_time
-        if add_time:
-            st.caption("Basic features (hour 0-23, day-of-week 0-6, day-of-month 1-31) always included. Enable extras:")
-            c1, c2, c3 = st.columns(3)
-            tf = {"hour_of_day": True, "day_of_week": True, "day_of_month": True}
-            tf["unix_timestamp"] = c1.checkbox("Unix timestamp",        value=existing_tf.get("unix_timestamp", False),
-                help="Seconds since 1970-01-01. Useful as a linear time trend proxy for tree models.")
-            tf["julian_date"]    = c1.checkbox("Julian date (DOY)",     value=existing_tf.get("julian_date", False),
-                help="Day-of-year (1-366). Captures seasonal variation without cyclical encoding.")
-            tf["calendar_date"]  = c1.checkbox("Calendar date (int)",   value=existing_tf.get("calendar_date", False),
-                help="Integer days since 1970-01-01, day-resolution. Good for long-term trend.")
-            tf["cyclical_hour"]  = c2.checkbox("Cyclical hour sin/cos", value=existing_tf.get("cyclical_hour", False),
-                help="Encodes hour as sin/cos so hour 23 is treated as close to hour 0. Better than raw integer for linear models.")
-            tf["cyclical_dow"]   = c2.checkbox("Cyclical DOW sin/cos",  value=existing_tf.get("cyclical_dow", False),
-                help="Circular day-of-week encoding. Sunday wraps around to Monday correctly.")
-            tf["cyclical_doy"]   = c2.checkbox("Cyclical DOY sin/cos",  value=existing_tf.get("cyclical_doy", False),
-                help="Circular day-of-year encoding. Dec 31 treated as adjacent to Jan 1.")
-            tf["season"]         = c3.checkbox("Season (DJF/MAM/JJA/SON)", value=existing_tf.get("season", False),
-                help="Meteorological season as 0-3: DJF(winter)=0, MAM(spring)=1, JJA(summer)=2, SON(autumn)=3.")
-            tf["day_name"]       = c3.checkbox("Day name & weekend flag",   value=existing_tf.get("day_name", False),
-                help="Adds day-of-week number (0-6) and binary is_weekend (1=Sat/Sun). Traffic-related PM differs on weekends.")
-            config["feature_engineering"]["time_feature_flags"] = tf
-
     with st.expander("⚙️ Training Settings", expanded=False):
         st.caption(
             "Controls the train/test split, cross-validation strategy, "
@@ -1308,24 +1678,65 @@ def render_modelling():
                 "never used to train on past. 5 folds is a good default; reduce to 3 for very small datasets."
             ),
         )
-        all_models = ["linear_regression", "ridge", "lasso", "random_forest", "xgboost"]
-        current = config["training"].get("selected_models", all_models)
-        selected_models = c3.multiselect(
-            "Models to train",
-            all_models,
-            default=current,
+        validation_labels = {
+            "TimeSeriesSplit (chronological CV)": "timeseriessplit",
+            "K-Fold (random CV)": "kfold",
+            "Holdout (single train/test split)": "holdout",
+        }
+        current_val = str(config["training"].get("validation_method", "timeseriessplit")).strip().lower()
+        current_val_label = next(
+            (lbl for lbl, key in validation_labels.items() if key == current_val),
+            "TimeSeriesSplit (chronological CV)",
+        )
+        validation_label = c3.selectbox(
+            "Validation method",
+            list(validation_labels.keys()),
+            index=list(validation_labels.keys()).index(current_val_label),
             help=(
-                "Choose which models to train. All selected models run in sequence and appear in the leaderboard.\n\n"
-                "• **linear_regression** — baseline OLS, no regularisation\n"
-                "• **ridge** — L2 regularisation, shrinks coefficients smoothly\n"
-                "• **lasso** — L1 regularisation, can zero out irrelevant features\n"
-                "• **random_forest** — ensemble of decision trees, handles non-linearity\n"
-                "• **xgboost** — gradient-boosted trees, often best on tabular data (requires install)"
+                "Choose how models are validated:\n\n"
+                "• **TimeSeriesSplit** — chronological cross-validation (default, leakage-safe for time series).\n"
+                "• **K-Fold** — standard random k-fold cross-validation.\n"
+                "• **Holdout** — a single chronological train/test split (no cross-validation)."
             ),
         )
         config["training"]["test_size"] = test_size
         config["training"]["cross_validation_folds"] = cv_folds
-        config["training"]["selected_models"] = selected_models if selected_models else all_models
+        config["training"]["validation_method"] = validation_labels[validation_label]
+
+        st.markdown("**Model selection**")
+        st.caption(
+            "Choose a model family, then pick the specific models to train. "
+            "All selected models run in sequence and appear in the leaderboard."
+        )
+        linear_keys = list(MODEL_GROUPS["Statistical Models"])
+        nonlinear_keys = list(MODEL_GROUPS["Machine Learning Models"])
+        family_choice = st.radio(
+            "Model family",
+            ["Linear models", "Non-linear models", "Both"],
+            index=2,
+            horizontal=True,
+            help=(
+                "• **Linear models** — OLS, Multiple Linear Regression, Ridge, Lasso (interpretable coefficients).\n"
+                "• **Non-linear models** — Random Forest, XGBoost (capture non-linear sensor behaviour).\n"
+                "• **Both** — choose freely from every available model."
+            ),
+        )
+        if family_choice == "Linear models":
+            available_keys = linear_keys
+        elif family_choice == "Non-linear models":
+            available_keys = nonlinear_keys
+        else:
+            available_keys = linear_keys + nonlinear_keys
+
+        prev_selected = [m for m in config["training"].get("selected_models", available_keys) if m in available_keys]
+        selected_models = st.multiselect(
+            "Models to train",
+            options=available_keys,
+            default=prev_selected or available_keys,
+            format_func=lambda k: MODEL_DISPLAY_NAMES.get(k, k),
+            help="Pick one or more models from the chosen family.",
+        )
+        config["training"]["selected_models"] = selected_models if selected_models else available_keys
 
     with st.expander("⚙️ Manual Hyperparameters", expanded=False):
         st.caption(
@@ -1428,49 +1839,37 @@ def render_modelling():
 
     st.session_state.config = config
 
-    # ---- Feature preview & variable selection ----
+    # ---- Feature subset selection (from the prepared dataset) ----
     st.markdown("---")
-    st.markdown("### 🔢 Variable Selection")
-    st.caption("Preview engineered features, then pick exactly which columns to pass to the models.")
-    if st.button("👁️ Preview Features", key="preview_features"):
-        from modules.feature_engineering import engineer_features
-        try:
-            preview = engineer_features(
-                dataframe=merged,
-                timestamp_column=config["data"]["timestamp_column"],
-                target_column=target_col_full,
-                config=config["feature_engineering"],
-            )
-            st.session_state.featured_preview = preview
-            st.session_state.selected_features = None
-        except Exception as e:
-            st.error(f"❌ Feature preview error: {e}")
+    st.markdown("### 🔢 Feature Subset")
+    st.caption(
+        "These are the engineered, normalized features from the previous steps. "
+        "Optionally restrict training to a subset (leave empty to use all)."
+    )
+    with st.expander("📋 Prepared dataset preview (first 5 rows)", expanded=False):
+        st.dataframe(model_df[sensor_base_cols].head(5), width='stretch')
+        render_df_download(model_df, key="model_df_csv", filename="modelling_dataset.csv")
 
-    if st.session_state.featured_preview is not None:
-        fp = st.session_state.featured_preview
-        all_feat_cols = [c for c in fp.columns if c not in [config["data"]["timestamp_column"], target_col_full]]
-        st.markdown(info_pill(f"Available features: {len(all_feat_cols)}"), unsafe_allow_html=True)
-        with st.expander("📋 Feature preview (first 5 rows)", expanded=False):
-            st.dataframe(fp[all_feat_cols].head(5), use_container_width=True)
-        prev_sel = st.session_state.selected_features or all_feat_cols
-        valid_prev = [c for c in prev_sel if c in all_feat_cols]
-        selected = st.multiselect(
-            "Select features for training (empty = use all)",
-            options=all_feat_cols, default=valid_prev, key="feat_multiselect",
-        )
-        st.session_state.selected_features = selected if selected else None
+    prev_sel = st.session_state.selected_features or sensor_base_cols
+    valid_prev = [c for c in prev_sel if c in sensor_base_cols]
+    selected = st.multiselect(
+        "Features for training (empty = use all)",
+        options=sensor_base_cols,
+        default=valid_prev,
+        key="feat_multiselect",
+    )
+    st.session_state.selected_features = selected if selected else None
 
     st.markdown("---")
-    if st.button("🚀 Train Models", key="run_modeling", use_container_width=True):
+    if st.button("🚀 Train Models", key="run_modeling", width='stretch'):
         with st.spinner("Training models… This may take a moment."):
             try:
                 cfg_text = _cfg_to_json(config)
                 subset_json = json.dumps(st.session_state.selected_features)
-                outputs = cached_modeling(merged, cfg_text, subset_json)
+                outputs = cached_train_prepared(model_df, target_col, cfg_text, subset_json)
                 st.session_state.modeling_outputs = outputs
                 st.session_state.selected_model_name = outputs["best_model_name"]
-                for k in ["post_analysis_outputs", "export_bundle"]:
-                    st.session_state[k] = None
+                _reset_downstream(*_DOWNSTREAM_FROM_MODELING)
                 st.success("✅ All models trained successfully!")
             except Exception as e:
                 st.error(f"❌ {e}")
@@ -1479,9 +1878,10 @@ def render_modelling():
     if out is not None:
         st.markdown("### 🏅 Leaderboard")
         st.dataframe(
-            out["leaderboard"].style.highlight_min(subset=["rmse", "mae"], color="#065f4630")
+            _format_metric_dataframe(out["leaderboard"])
+            .style.highlight_min(subset=["rmse", "mae"], color="#065f4630")
             .highlight_max(subset=["r2", "pearson_r"], color="#065f4630"),
-            use_container_width=True,
+            width='stretch',
         )
         st.success(f"🏆 Best model: **{out['best_model_name']}**")
         tuned = {n: r for n, r in out["training_results"].items() if r.best_params}
@@ -1531,12 +1931,14 @@ def render_modelling():
                         for _col, _mname in zip(_cols, _row_models):
                             with _col:
                                 st.markdown(f"**{_mname}**")
-                                st.plotly_chart(
+                                _display_chart_with_downloads(
                                     create_scatter_with_fit(
                                         _sel_results[_mname].full_predictions,
                                         model_name=_mname,
                                     ),
-                                    use_container_width=True,
+                                    _sel_results[_mname].full_predictions,
+                                    key=f"cmp_scatter_{_mname}",
+                                    filename_prefix=f"compare_scatter_{_mname}",
                                 )
 
                 # ---- Tab 2: Time-series overlay ----
@@ -1545,9 +1947,9 @@ def render_modelling():
                         "All selected model predictions overlaid on a single time-series chart. "
                         "Reference (actual) values are shown in white."
                     )
-                    st.plotly_chart(
-                        create_multi_model_timeseries(_sel_results),
-                        use_container_width=True,
+                    _display_chart_with_downloads(
+                        create_multi_model_timeseries(_sel_results), None,
+                        key="cmp_ts", filename_prefix="compare_timeseries",
                     )
 
                 # ---- Tab 3: Metrics table ----
@@ -1566,7 +1968,7 @@ def render_modelling():
                     _cmp_data = {}
                     for _mk in _metric_keys:
                         _cmp_data[_metric_labels[_mk]] = {
-                            m: round(float(_sel_results[m].metrics.get(_mk, float("nan"))), 4)
+                            m: round(float(_sel_results[m].metrics.get(_mk, float("nan"))), 2)
                             for m in _selected_compare
                         }
                     _cmp_df = pd.DataFrame(_cmp_data).T
@@ -1589,7 +1991,11 @@ def render_modelling():
 
                     st.dataframe(
                         _cmp_df.style.apply(_highlight_best, axis=1),
-                        use_container_width=True,
+                        width='stretch',
+                    )
+                    render_df_download(
+                        _cmp_df.reset_index(), key="cmp_metrics_csv",
+                        filename="model_comparison_metrics.csv",
                     )
                     st.caption(
                         "**↓** = lower is better  ·  **↑** = higher is better  ·  **→ 0 / → 1** = closer to target is better. "
@@ -1600,14 +2006,15 @@ def render_modelling():
                     st.markdown("---")
                     st.markdown("**Visual metric comparison:**")
                     _lb_filtered = out["leaderboard"][out["leaderboard"]["model_name"].isin(_selected_compare)]
-                    st.plotly_chart(
+                    _display_chart_with_downloads(
                         create_multi_model_metrics_bar(_lb_filtered),
-                        use_container_width=True,
+                        _format_metric_dataframe(_lb_filtered),
+                        key="cmp_metrics_bar", filename_prefix="compare_metrics_bar",
                     )
 
 
     st.markdown("---")
-    if st.button("Next ➡️", key="next_modeling_always", use_container_width=True, disabled=(out is None),
+    if st.button("Next ➡️", key="next_modeling_always", width='stretch', disabled=(out is None),
                  help="Train models first, then click Next to proceed to Results."):
         go_next()
 
@@ -1643,7 +2050,9 @@ def render_results():
         render_metric_row(result.metrics, ["bias", "pearson_r", "slope", "intercept"],
                           ["Bias", "Pearson r", "Slope", "Intercept"])
         st.markdown("#### Full Leaderboard")
-        st.dataframe(out["leaderboard"], use_container_width=True)
+        leaderboard_fmt = _format_metric_dataframe(out["leaderboard"])
+        st.dataframe(leaderboard_fmt, width='stretch')
+        render_df_download(leaderboard_fmt, key="leaderboard_csv", filename="leaderboard.csv")
 
     with tabs[1]:
         st.markdown("#### Model Explainability")
@@ -1653,10 +2062,14 @@ def render_results():
             names = list(imp.keys())[:top_n]
             values = [imp[n] for n in names]
             fig = go.Figure(go.Bar(x=values, y=names, orientation="h", marker_color="#6366f1"))
-            fig.update_layout(title=f"Feature Importance — {sel_name}", xaxis_title="Importance",
-                              yaxis=dict(autorange="reversed"), template="plotly_dark",
-                              height=max(300, top_n * 26))
-            st.plotly_chart(fig, use_container_width=True)
+            title, x_label, y_label = _chart_customization(
+                "res_imp", f"Feature Importance — {sel_name}", "Importance", "Feature"
+            )
+            fig.update_layout(title=title, xaxis_title=x_label, yaxis_title=y_label,
+                              template="plotly_dark", height=max(300, top_n * 26))
+            fig.update_yaxes(autorange="reversed")
+            imp_df = pd.DataFrame({"feature": names, "importance": values})
+            _display_chart_with_downloads(fig, imp_df, key="res_imp", filename_prefix="feature_importance")
         if result.coefficients is not None:
             coefs = result.coefficients
             top_n = min(20, len(coefs))
@@ -1664,111 +2077,212 @@ def render_results():
             values = [coefs[n] for n in names]
             colors = ["#10b981" if v >= 0 else "#ef4444" for v in values]
             fig = go.Figure(go.Bar(x=values, y=names, orientation="h", marker_color=colors))
-            fig.update_layout(title=f"Coefficients — {sel_name}", xaxis_title="Coefficient",
-                              yaxis=dict(autorange="reversed"), template="plotly_dark",
-                              height=max(300, top_n * 26))
-            st.plotly_chart(fig, use_container_width=True)
+            title, x_label, y_label = _chart_customization(
+                "res_coef", f"Coefficients — {sel_name}", "Coefficient", "Feature"
+            )
+            fig.update_layout(title=title, xaxis_title=x_label, yaxis_title=y_label,
+                              template="plotly_dark", height=max(300, top_n * 26))
+            fig.update_yaxes(autorange="reversed")
+            coef_df = pd.DataFrame({"feature": names, "coefficient": values})
+            _display_chart_with_downloads(fig, coef_df, key="res_coef", filename_prefix="coefficients")
             if result.intercept_value is not None:
-                st.markdown(info_pill(f"Intercept: {result.intercept_value:.4f}"), unsafe_allow_html=True)
+                st.markdown(info_pill(f"Intercept: {result.intercept_value:.2f}"), unsafe_allow_html=True)
         if result.feature_importance is None and result.coefficients is None:
             st.info("No explainability data available for this model type.")
 
     with tabs[2]:
         st.markdown("#### Scatter Plot — Predicted vs Actual (with 1:1 & OLS Fit)")
         fig_scatter = create_scatter_with_fit(result.full_predictions, model_name=sel_name)
-        st.plotly_chart(fig_scatter, use_container_width=True)
+        title, x_label, y_label = _chart_customization(
+            "res_scatter", f"Predicted vs Actual — {sel_name}", "Actual", "Predicted"
+        )
+        fig_scatter.update_layout(title=title, xaxis_title=x_label, yaxis_title=y_label)
+        _display_chart_with_downloads(
+            fig_scatter, result.full_predictions, key="res_scatter", filename_prefix="predicted_vs_actual"
+        )
 
     with tabs[3]:
         st.markdown("#### Multi-Model Comparison")
         comp_tabs = st.tabs(["📊 Scatter Grid", "📈 Time-Series Overlay", "📋 Metrics Bar"])
         with comp_tabs[0]:
-            st.plotly_chart(create_multi_model_scatter(out["training_results"]), use_container_width=True)
+            _display_chart_with_downloads(
+                create_multi_model_scatter(out["training_results"]), None,
+                key="res_multi_scatter", filename_prefix="multi_model_scatter",
+            )
         with comp_tabs[1]:
-            st.plotly_chart(create_multi_model_timeseries(out["training_results"]), use_container_width=True)
+            _display_chart_with_downloads(
+                create_multi_model_timeseries(out["training_results"]), None,
+                key="res_multi_ts", filename_prefix="multi_model_timeseries",
+            )
         with comp_tabs[2]:
-            st.plotly_chart(create_multi_model_metrics_bar(out["leaderboard"]), use_container_width=True)
+            _display_chart_with_downloads(
+                create_multi_model_metrics_bar(out["leaderboard"]), _format_metric_dataframe(out["leaderboard"]),
+                key="res_multi_bar", filename_prefix="multi_model_metrics",
+            )
 
-    if st.button("Next ➡️", key="next_results", use_container_width=True):
+    if st.button("Next ➡️", key="next_results", width='stretch'):
         go_next()
 
 
+
+
 # ---------------------------------------------------------------------------
-# STEP 7: Post-Analysis
+# STEP 10: Statistical Diagnostics
 # ---------------------------------------------------------------------------
 
-def render_post_analysis():
-    st.subheader("🔬 Post-Calibration Analysis")
+def render_statistical_diagnostics():
+    st.subheader("\U0001f4d0 Statistical Diagnostics")
     out = st.session_state.modeling_outputs
     if out is None or st.session_state.config is None:
         st.info("Complete the **Modelling** step first.")
         return
 
-    config = st.session_state.config
+    eligible = [
+        model_name for model_name in ["ols_regression", "multiple_linear_regression"]
+        if model_name in out["training_results"]
+    ]
+    if not eligible:
+        st.info("Train OLS Regression or Multiple Linear Regression to view statistical diagnostics.")
+        return
+
+    selected = st.selectbox(
+        "Diagnostic model",
+        eligible,
+        index=eligible.index(st.session_state.selected_model_name)
+        if st.session_state.selected_model_name in eligible else 0,
+        format_func=_model_label,
+        key="diagnostic_model_select",
+    )
+    result = out["training_results"][selected]
+    model_df = out["featured_data"]
+    feature_names = [column for column in result.feature_names if column in model_df.columns]
+
+    coefficient_table = _format_coefficient_table(result.coefficient_table)
+    vif_table = compute_vif(model_df[feature_names]) if feature_names else pd.DataFrame(columns=["Variable", "VIF"])
+    shapiro_result = shapiro_wilk_test(result.residuals if result.residuals is not None else pd.Series(dtype=float))
+    st.session_state.diagnostics_outputs = {
+        "model_name": selected,
+        "coefficient_table": coefficient_table,
+        "vif_table": vif_table,
+        "shapiro_wilk": shapiro_result,
+    }
+
+    tab1, tab2, tab3 = st.tabs(["Coefficient Table", "VIF Table", "Shapiro-Wilk Test"])
+    with tab1:
+        st.dataframe(coefficient_table, width='stretch')
+        render_df_download(
+            coefficient_table,
+            key="coefficient_table_download",
+            filename=f"{selected}_coefficient_table.csv",
+        )
+    with tab2:
+        st.dataframe(vif_table, width='stretch')
+        render_df_download(
+            vif_table,
+            key="vif_table_download",
+            filename=f"{selected}_vif_table.csv",
+        )
+    with tab3:
+        c1, c2 = st.columns(2)
+        c1.metric("Statistic", f"{shapiro_result.get('statistic', float('nan')):.2f}")
+        c2.metric("P-value", f"{shapiro_result.get('p_value', float('nan')):.4f}")
+
+    if st.button("Next \u27a1\ufe0f", key="next_statistical_diagnostics", width='stretch'):
+        go_next()
+
+# ---------------------------------------------------------------------------
+# STEP 11: Residual Analysis
+# ---------------------------------------------------------------------------
+
+def render_residual_analysis():
+    st.subheader("🔬 Residual Analysis")
+    out = st.session_state.modeling_outputs
+    if out is None or st.session_state.config is None:
+        st.info("Complete the **Modelling** step first.")
+        return
+
     sel_name = st.session_state.selected_model_name or out["best_model_name"]
     result = out["training_results"][sel_name]
+    predictions_df = result.full_predictions
 
-    with st.expander("⚙️ Drift Analysis Settings", expanded=False):
-        c1, c2 = st.columns(2)
-        rolling_window = c1.number_input("Rolling window", 3, 48,
-                                         int(config.get("drift_analysis", {}).get("rolling_window", 6)))
-        drift_thresh = c2.number_input("Drift threshold multiplier", 1.0, 5.0,
-                                       float(config.get("drift_analysis", {}).get("drift_threshold", 1.5)), 0.1)
-        show_ba = st.checkbox("Show Bland-Altman agreement plot", value=False, key="show_bland_altman")
-        config.setdefault("drift_analysis", {})["rolling_window"] = rolling_window
-        config["drift_analysis"]["drift_threshold"] = drift_thresh
-        st.session_state.config = config
+    # Plot style options
+    PLOT_STYLES = {"Scatter": "markers", "Connected Line": "lines", "Dotted Line": "lines"}
+    PLOT_DASHES = {"Scatter": None, "Connected Line": None, "Dotted Line": "dot"}
 
-    if st.button("🚀 Run Post-Analysis", key="run_post", use_container_width=True):
-        with st.spinner("Analysing calibration quality…"):
-            try:
-                pa_out = generate_post_analysis_outputs(
-                    result.full_predictions,
-                    rolling_window=rolling_window,
-                    drift_threshold=drift_thresh,
-                )
-                st.session_state.post_analysis_outputs = pa_out
-                st.success("✅ Post-analysis completed")
-            except Exception as e:
-                st.error(f"❌ {e}")
+    def _apply_plot_style(fig, style_name):
+        """Apply the selected plot style to the first data trace."""
+        mode = PLOT_STYLES.get(style_name, "markers")
+        dash = PLOT_DASHES.get(style_name)
+        if fig.data:
+            fig.data[0].mode = mode
+            if dash:
+                fig.data[0].line = dict(dash=dash)
+        return fig
 
-    pa = st.session_state.post_analysis_outputs
-    if pa is not None:
-        tab_labels = ["📊 Pred vs Actual", "📉 Residuals", "📈 Time Series", "🌊 Rolling Error", "📋 Residual Dist"]
-        if show_ba:
-            tab_labels.append("⚖️ Bland-Altman")
-        tabs = st.tabs(tab_labels)
+    tabs = st.tabs([
+        "📊 Predicted vs Actual",
+        "📉 Residual vs Fitted",
+        "📊 Residual Histogram",
+        "📐 QQ Plot",
+    ])
 
-        with tabs[0]:
-            # Enhanced scatter with 1:1 line and OLS fit
-            fig = create_scatter_with_fit(result.full_predictions, model_name=sel_name)
-            st.plotly_chart(fig, use_container_width=True)
-        with tabs[1]:
-            st.plotly_chart(pa["residual_plot_fig"], use_container_width=True)
-        with tabs[2]:
-            st.plotly_chart(pa["time_series_overlay_fig"], use_container_width=True)
-        with tabs[3]:
-            st.plotly_chart(pa["rolling_error_fig"], use_container_width=True)
-            if not pa["drift_periods"].empty:
-                st.warning(f"⚠️ Drift detected in {len(pa['drift_periods'])} time steps")
-                st.dataframe(
-                    pa["drift_periods"][["timestamp", "rolling_rmse", "rolling_bias", "drift_threshold"]].head(20),
-                    use_container_width=True,
-                )
-            else:
-                st.success("✅ No significant drift detected.")
-        with tabs[4]:
-            st.plotly_chart(pa["residual_histogram_fig"], use_container_width=True)
-        if show_ba and len(tabs) > 5:
-            with tabs[5]:
-                fig_ba = create_bland_altman_plot(result.full_predictions, model_name=sel_name)
-                st.plotly_chart(fig_ba, use_container_width=True)
-                st.caption(
-                    "Bland-Altman plot: points should cluster around the mean bias line "
-                    "within ±1.96σ limits of agreement."
-                )
+    # --- Tab 1: Predicted vs Actual ---
+    with tabs[0]:
+        title_1, x_1, y_1 = _chart_customization(
+            "ra_pva", "Predicted vs Actual", "Actual (Reference)", "Predicted (Calibrated)",
+        )
+        style_1 = st.selectbox("Plot style", list(PLOT_STYLES.keys()), key="ra_pva_style")
+        fig_pva = create_predicted_vs_actual_figure(predictions_df)
+        fig_pva.update_layout(title=title_1, xaxis_title=x_1, yaxis_title=y_1)
+        _apply_plot_style(fig_pva, style_1)
+        source_pva = predictions_df[["actual", "predicted"]].copy()
+        _display_chart_with_downloads(fig_pva, source_pva, key="ra_pva", filename_prefix="predicted_vs_actual")
 
-        if st.button("Next ➡️", key="next_post", use_container_width=True):
-            go_next()
+    # --- Tab 2: Residual vs Fitted ---
+    with tabs[1]:
+        title_2, x_2, y_2 = _chart_customization(
+            "ra_rvf", "Residual vs Fitted", "Predicted Value", "Residual (Predicted − Actual)",
+        )
+        style_2 = st.selectbox("Plot style", list(PLOT_STYLES.keys()), key="ra_rvf_style")
+        fig_rvf = create_residual_vs_predicted_figure(predictions_df)
+        fig_rvf.update_layout(title=title_2, xaxis_title=x_2, yaxis_title=y_2)
+        _apply_plot_style(fig_rvf, style_2)
+        source_rvf = pd.DataFrame({
+            "predicted": predictions_df["predicted"],
+            "residual": predictions_df["predicted"] - predictions_df["actual"],
+        })
+        _display_chart_with_downloads(fig_rvf, source_rvf, key="ra_rvf", filename_prefix="residual_vs_fitted")
+
+    # --- Tab 3: Residual Histogram ---
+    with tabs[2]:
+        title_3, x_3, y_3 = _chart_customization(
+            "ra_hist", "Residual Distribution", "Residual (Predicted − Actual)", "Frequency",
+        )
+        fig_hist = create_residual_histogram(predictions_df)
+        fig_hist.update_layout(title=title_3, xaxis_title=x_3, yaxis_title=y_3)
+        source_hist = pd.DataFrame({
+            "residual": predictions_df["predicted"] - predictions_df["actual"],
+        })
+        _display_chart_with_downloads(fig_hist, source_hist, key="ra_hist", filename_prefix="residual_histogram")
+
+    # --- Tab 4: QQ Plot ---
+    with tabs[3]:
+        title_4, x_4, y_4 = _chart_customization(
+            "ra_qq", "QQ Plot — Residuals vs Normal Distribution",
+            "Theoretical Quantiles", "Sample Quantiles",
+        )
+        style_4 = st.selectbox("Plot style", list(PLOT_STYLES.keys()), key="ra_qq_style")
+        fig_qq = create_qq_plot(predictions_df)
+        fig_qq.update_layout(title=title_4, xaxis_title=x_4, yaxis_title=y_4)
+        _apply_plot_style(fig_qq, style_4)
+        residuals_arr = np.asarray(predictions_df["predicted"] - predictions_df["actual"], dtype=float)
+        source_qq = pd.DataFrame({"residual": residuals_arr})
+        _display_chart_with_downloads(fig_qq, source_qq, key="ra_qq", filename_prefix="qq_plot")
+
+    st.session_state.residual_analysis_outputs = {"model_name": sel_name}
+
+    if st.button("Next ➡️", key="next_residual_analysis", width='stretch'):
+        go_next()
 
 
 # ---------------------------------------------------------------------------
@@ -1786,7 +2300,7 @@ def render_export():
     sel_name = st.session_state.selected_model_name or out["best_model_name"]
     result = out["training_results"][sel_name]
     ts_col = config["data"]["timestamp_column"]
-    target_col = f"{config['data']['reference_prefix']}_{config['data']['target_column']}"
+    target_col = st.session_state.selected_target or f"{config['data']['reference_prefix']}_{config['data']['target_column']}"
 
     calibrated = (
         out["featured_data"][[ts_col, target_col]]
@@ -1799,9 +2313,10 @@ def render_export():
 
     st.markdown(info_pill(f"Model: {sel_name}") + info_pill(f"Features: {len(result.feature_names)}"),
                 unsafe_allow_html=True)
-    st.dataframe(calibrated.head(20), use_container_width=True)
+    st.dataframe(calibrated.head(20), width='stretch')
+    render_df_download(calibrated, key="calibrated_csv", filename="calibrated_dataset.csv")
 
-    if st.button("🚀 Prepare Export Bundle", key="run_export", use_container_width=True):
+    if st.button("🚀 Prepare Export Bundle", key="run_export", width='stretch'):
         with st.spinner("Packaging artefacts…"):
             try:
                 bundle = build_export_bundle(
@@ -1811,6 +2326,10 @@ def render_export():
                     metrics=result.metrics,
                     feature_names=result.feature_names,
                     config=config,
+                    coefficient_table=getattr(result, "coefficient_table", None),
+                    selected_target=st.session_state.selected_target,
+                    selected_predictors=st.session_state.selected_predictors,
+                    modelling_objective=config.get("modelling", {}).get("objective"),
                 )
                 st.session_state.export_bundle = bundle
                 st.success("✅ Export bundle ready!")
@@ -1822,18 +2341,24 @@ def render_export():
         st.markdown("### 📦 Download Artefacts")
         c1, c2, c3 = st.columns(3)
         c1.download_button("📄 Calibrated Dataset (CSV)", bundle["calibrated_dataset_csv"],
-                           file_name="calibrated_dataset.csv", mime="text/csv", use_container_width=True)
+                           file_name="calibrated_dataset.csv", mime="text/csv", width='stretch')
         c2.download_button("🤖 Trained Model (.pkl)", bundle["model_pickle"],
-                           file_name=f"{sel_name}.pkl", mime="application/octet-stream", use_container_width=True)
+                           file_name=f"{sel_name}.pkl", mime="application/octet-stream", width='stretch')
         c3.download_button("📊 Metrics (JSON)", bundle["metrics_json"],
-                           file_name="metrics.json", mime="application/json", use_container_width=True)
+                           file_name="metrics.json", mime="application/json", width='stretch')
         c4, c5, c6 = st.columns(3)
         c4.download_button("⚙️ Config (JSON)", bundle["config_json"],
-                           file_name="config.json", mime="application/json", use_container_width=True)
+                           file_name="config.json", mime="application/json", width='stretch')
         c5.download_button("⚙️ Config (YAML)", bundle["config_yaml"],
-                           file_name="config.yaml", mime="text/yaml", use_container_width=True)
+                           file_name="config.yaml", mime="text/yaml", width='stretch')
         c6.download_button("📋 Metadata (JSON)", bundle["metadata_json"],
-                           file_name="metadata.json", mime="application/json", use_container_width=True)
+                           file_name="metadata.json", mime="application/json", width='stretch')
+        c7, c8, c9 = st.columns(3)
+        c7.download_button("📄 project_run.json", bundle["project_run_json"],
+                           file_name="project_run.json", mime="application/json", width='stretch')
+        if "model_summary_pdf" in bundle:
+            c8.download_button("📑 PDF Model Report", bundle["model_summary_pdf"],
+                               file_name=f"{sel_name}_report.pdf", mime="application/pdf", width='stretch')
 
 
 # ---------------------------------------------------------------------------
@@ -1842,7 +2367,7 @@ def render_export():
 
 _DEFAULT_README = """\
 # Air Quality Sensor Calibration Lab — User Guide
-**Version 4.0** | Research-grade ML pipeline for calibrating low-cost air quality sensors
+**Version 5.0** | Research-grade ML pipeline for calibrating low-cost air quality sensors
 
 ---
 
@@ -1961,58 +2486,21 @@ def render_readme():
             base = readme_path.read_text(encoding="utf-8") if readme_path.exists() else _DEFAULT_README
         except Exception:
             base = _DEFAULT_README
-        st.session_state.readme_content = base + "\n\n---\n" + _DEFAULT_README.split("## My Notes")[1]
+        st.session_state.readme_content = base
 
-    # ---- Toggle state ----
-    if "readme_edit_open" not in st.session_state:
-        st.session_state.readme_edit_open = False
-
-    # ---- Top action row: small Edit toggle + download ----
-    hdr_l, hdr_r = st.columns([8, 2])
-    with hdr_r:
-        btn_label = "✏️ Close Editor" if st.session_state.readme_edit_open else "✏️ Edit"
-        if st.button(btn_label, key="readme_toggle_edit", use_container_width=True,
-                     help="Toggle the Markdown editor on/off"):
-            st.session_state.readme_edit_open = not st.session_state.readme_edit_open
-            st.rerun()
-    with hdr_l:
-        st.caption(
-            "Live Markdown preview. Click **✏️ Edit** to open the editor. "
-            "Your changes persist for the full session."
-        )
-
-    # ---- Preview (always visible) ----
+    # ---- Read-only rendering ----
+    st.caption("Read-only documentation. Download the Markdown file using the button below.")
     st.markdown(st.session_state.readme_content, unsafe_allow_html=False)
 
-    # ---- Editor panel (shown only when toggled open) ----
-    if st.session_state.readme_edit_open:
-        st.markdown("---")
-        st.markdown("#### ✏️ Markdown Editor")
-        edited = st.text_area(
-            "Edit the guide below:",
-            value=st.session_state.readme_content,
-            height=500,
-            key="readme_textarea",
-            label_visibility="collapsed",
-            help="Standard Markdown supported. Changes are applied to the preview above in real-time.",
-        )
-        st.session_state.readme_content = edited
-
-        btn1, btn2, btn3 = st.columns(3)
-        btn1.download_button(
-            "💾 Download .md",
-            data=edited.encode("utf-8"),
-            file_name="calibration_lab_guide.md",
-            mime="text/markdown",
-            use_container_width=True,
-        )
-        if btn2.button("↩️ Reset to Default", use_container_width=True, key="reset_readme"):
-            st.session_state.readme_content = None
-            st.session_state.readme_edit_open = False
-            st.rerun()
-        if btn3.button("✅ Close Editor", use_container_width=True, key="readme_close_bottom"):
-            st.session_state.readme_edit_open = False
-            st.rerun()
+    # ---- Download button ----
+    st.download_button(
+        "💾 Download Markdown",
+        data=st.session_state.readme_content.encode("utf-8"),
+        file_name="calibration_lab_guide.md",
+        mime="text/markdown",
+        width='stretch',
+        key="readme_download_md",
+    )
 
 
 
@@ -2037,7 +2525,7 @@ def main():
 
     # Sidebar info
     st.sidebar.markdown("---")
-    st.sidebar.caption("v4.0 · UX & Transparency Release")
+    st.sidebar.caption("v5.0 · Calibration Lab")
     if st.session_state.config:
         st.sidebar.caption(f"Target: {st.session_state.config['data']['target_column']}")
     if st.session_state.selected_model_name:
@@ -2048,11 +2536,15 @@ def main():
         STEPS[1]: render_preprocessing,
         STEPS[2]: render_alignment,
         STEPS[3]: render_eda,
-        STEPS[4]: render_modelling,
-        STEPS[5]: render_results,
-        STEPS[6]: render_post_analysis,
-        STEPS[7]: render_export,
-        STEPS[8]: render_readme,
+        STEPS[4]: render_variable_selection,
+        STEPS[5]: render_feature_engineering,
+        STEPS[6]: render_normalization,
+        STEPS[7]: render_modelling,
+        STEPS[8]: render_results,
+        STEPS[9]: render_statistical_diagnostics,
+        STEPS[10]: render_residual_analysis,
+        STEPS[11]: render_export,
+        STEPS[12]: render_readme,
     }
     dispatch[st.session_state.current_step]()
 

@@ -30,7 +30,12 @@ def summarize_missing_values(dataframe: pd.DataFrame) -> pd.DataFrame:
     return summary.sort_values("missing_count", ascending=False).reset_index(drop=True)
 
 
-def create_missing_value_heatmap(dataframe: pd.DataFrame) -> go.Figure:
+def create_missing_value_heatmap(
+    dataframe: pd.DataFrame,
+    title: str = "Missing Data Plot",
+    x_label: str = "Row Index",
+    y_label: str = "Column",
+) -> go.Figure:
     """Create a heatmap showing the position of missing values across columns."""
     missing_matrix = dataframe.isna().astype(int)
     fig = go.Figure(
@@ -44,9 +49,9 @@ def create_missing_value_heatmap(dataframe: pd.DataFrame) -> go.Figure:
         )
     )
     fig.update_layout(
-        title="Missing Value Heatmap",
-        xaxis_title="Row Index",
-        yaxis_title="Column",
+        title=title,
+        xaxis_title=x_label,
+        yaxis_title=y_label,
         template="plotly_dark",
         height=max(300, len(missing_matrix.columns) * 28),
     )
@@ -83,20 +88,27 @@ def create_distribution_figure(
     dataframe: pd.DataFrame,
     column: str,
     title_suffix: str = "",
+    title: Optional[str] = None,
+    x_label: Optional[str] = None,
+    y_label: str = "Count",
 ) -> go.Figure:
     """Create a histogram for a selected column."""
-    title = f"Distribution: {column}"
-    if title_suffix:
-        title += f" ({title_suffix})"
+    chart_title = title or f"Distribution Plot: {column}"
+    if title_suffix and title is None:
+        chart_title += f" ({title_suffix})"
     fig = px.histogram(
         dataframe,
         x=column,
         nbins=30,
         marginal="box",
-        title=title,
+        title=chart_title,
         color_discrete_sequence=["#6366f1"],
     )
-    fig.update_layout(template="plotly_dark")
+    fig.update_layout(
+        xaxis_title=x_label or column,
+        yaxis_title=y_label,
+        template="plotly_dark",
+    )
     return fig
 
 
@@ -143,7 +155,7 @@ def create_before_after_distributions(
 # ---------------------------------------------------------------------------
 
 def create_correlation_heatmap(dataframe: pd.DataFrame) -> go.Figure:
-    """Create a correlation heatmap for numeric columns."""
+    """Create a Pearson correlation heatmap for numeric columns."""
     numeric_df = dataframe.select_dtypes(include="number")
     correlation = numeric_df.corr(numeric_only=True)
     fig = px.imshow(
@@ -151,9 +163,33 @@ def create_correlation_heatmap(dataframe: pd.DataFrame) -> go.Figure:
         text_auto=".2f",
         aspect="auto",
         color_continuous_scale="RdBu_r",
-        title="Correlation Heatmap",
+        title="Pearson Correlation Coefficient (r) Heatmap",
     )
-    fig.update_layout(template="plotly_dark")
+    fig.update_layout(
+        xaxis_title="Variable",
+        yaxis_title="Variable",
+        template="plotly_dark",
+    )
+    return fig
+
+
+def create_scatter_plot_matrix(
+    dataframe: pd.DataFrame,
+    columns: List[str],
+    title: str = "Scatter Plot Matrix",
+) -> go.Figure:
+    """Create a scatter plot matrix for selected numeric columns."""
+    selected = [col for col in columns if col in dataframe.columns]
+    if not selected:
+        selected = dataframe.select_dtypes(include=[np.number]).columns.tolist()[:4]
+    fig = px.scatter_matrix(
+        dataframe[selected].dropna(),
+        dimensions=selected,
+        title=title,
+        color_discrete_sequence=["#6366f1"],
+    )
+    fig.update_layout(template="plotly_dark", height=max(500, 120 * len(selected)))
+    fig.update_traces(diagonal_visible=False, marker=dict(size=4, opacity=0.65))
     return fig
 
 
@@ -276,6 +312,7 @@ def generate_eda_outputs(
         "distribution_figure": create_distribution_figure(dataframe, distribution_column),
         "correlation_figure": create_correlation_heatmap(dataframe),
         "missing_heatmap": create_missing_value_heatmap(dataframe),
+        "scatter_matrix_figure": create_scatter_plot_matrix(dataframe, numeric_columns[:4]),
         "time_series_figure": create_time_series_figure(dataframe, timestamp_column),
         "anomaly_figure": create_anomaly_figure(
             dataframe=dataframe,

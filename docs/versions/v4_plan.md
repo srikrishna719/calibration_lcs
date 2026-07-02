@@ -1,7 +1,7 @@
 # v4.0 — UX & Transparency Release
 
 **Date**: 2026-06-13  
-**Status**: Current  
+**Status**: Previous *(superseded by [v5.0](v5_plan.md))*  
 **Conversation**: `e248fc4f-1fae-479f-8014-40824b5f33c8`
 
 ---

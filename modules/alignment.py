@@ -53,7 +53,7 @@ def detect_optimal_lag(
     timestamp_column: str,
     reference_target_column: str,
     sensor_feature_column: str,
-    max_lag_steps: int = 6,
+    max_lag_steps: int = 0,
 ) -> int:
     """Estimate the lag maximizing cross-correlation between two series.
 
@@ -173,7 +173,7 @@ def align_and_merge_datasets(
         timestamp_column=timestamp_column,
         reference_target_column=reference_target_column,
         sensor_feature_column=sensor_feature_col,
-        max_lag_steps=int(config.get("max_lag_steps", 6)),
+        max_lag_steps=int(config.get("max_lag_steps", 0)),
     )
 
     sensor_aligned = apply_lag(sen_resampled, timestamp_column, lag_steps)
@@ -210,13 +210,25 @@ def align_and_merge_datasets(
     if merged.empty:
         raise ValueError("No overlapping aligned records were found between the datasets.")
 
+    matched_records = len(merged)
+    reference_records = len(ref_resampled)
+    sensor_records = len(sen_resampled)
+    unmatched_records = max(0, reference_records + sensor_records - (matched_records * 2))
+    alignment_percentage = round(
+        (matched_records / max(reference_records, sensor_records, 1)) * 100,
+        2,
+    )
+
     return merged, {
         "lag_steps": lag_steps,
         "resample_rule": rule,
         "aggregation": aggregation,
         "merge_strategy": merge_strategy,
         "lag_detection_column": sensor_feature_col,
-        "merged_rows": len(merged),
-        "reference_rows_after_resample": len(ref_resampled),
-        "sensor_rows_after_resample": len(sen_resampled),
+        "merged_rows": matched_records,
+        "matched_records": matched_records,
+        "unmatched_records": unmatched_records,
+        "alignment_percentage": alignment_percentage,
+        "reference_rows_after_resample": reference_records,
+        "sensor_rows_after_resample": sensor_records,
     }
