@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from string import Template
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -16,6 +17,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 
 class _SafeEncoder(json.JSONEncoder):
@@ -138,9 +140,36 @@ _INTERNAL_TO_DISPLAY = {
 }
 
 # ---------------------------------------------------------------------------
-# Premium CSS
+# Premium CSS — theme-parameterized (dark / light)
 # ---------------------------------------------------------------------------
-CUSTOM_CSS = """
+_PALETTES: Dict[str, Dict[str, str]] = {
+    "dark": {
+        "grad1": "#1e1b4b", "grad2": "#312e81", "grad3": "#4338ca",
+        "sidebar1": "#0f0a2e", "sidebar2": "#1e1b4b",
+        "header_text": "#e0e7ff", "subtext": "#a5b4fc",
+        "value_text": "#e0e7ff", "sidebar_label": "#c7d2fe",
+        "section_bg": "rgba(30, 27, 75, 0.4)",
+        "pill_bg": "rgba(99, 102, 241, 0.15)",
+        "page_bg": "#0f0a2e", "page_text": "#e0e7ff",
+        "step_dot_idle": "#1e1b4b",
+        "widget_bg": "#171433", "widget_border": "#4338ca",
+        "alert_border": "rgba(226, 232, 240, 0.15)",
+    },
+    "light": {
+        "grad1": "#e0e7ff", "grad2": "#c7d2fe", "grad3": "#818cf8",
+        "sidebar1": "#f8fafc", "sidebar2": "#eef2ff",
+        "header_text": "#1e1b4b", "subtext": "#4338ca",
+        "value_text": "#1e1b4b", "sidebar_label": "#312e81",
+        "section_bg": "rgba(99, 102, 241, 0.06)",
+        "pill_bg": "rgba(99, 102, 241, 0.10)",
+        "page_bg": "#f8fafc", "page_text": "#1e1b4b",
+        "step_dot_idle": "#c7d2fe",
+        "widget_bg": "#ffffff", "widget_border": "#c7d2fe",
+        "alert_border": "rgba(30, 27, 75, 0.10)",
+    },
+}
+
+_CUSTOM_CSS_TEMPLATE = Template("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
 
@@ -149,23 +178,129 @@ html, body, [class*="st-"] {
     font-family: 'Inter', sans-serif;
 }
 
+/* Page-wide chrome (keeps native Streamlit containers in sync with the toggle,
+   overriding Streamlit's own auto-detected OS/browser theme so the in-app
+   toggle is authoritative regardless of the visitor's environment) */
+[data-testid="stAppViewContainer"] {
+    background-color: $page_bg;
+    color: $page_text;
+}
+[data-testid="stHeader"] {
+    background-color: transparent;
+}
+[data-testid="stMarkdownContainer"] p,
+[data-testid="stMarkdownContainer"] li,
+[data-testid="stMarkdownContainer"] span,
+[data-testid="stMarkdownContainer"] strong,
+[data-testid="stMarkdownContainer"] h1,
+[data-testid="stMarkdownContainer"] h2,
+[data-testid="stMarkdownContainer"] h3,
+[data-testid="stMarkdownContainer"] h4,
+[data-testid="stMarkdownContainer"] h5 {
+    color: $page_text;
+}
+label, [data-testid="stWidgetLabel"] p,
+[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p,
+[data-testid="stMetricValue"], [data-testid="stMetricLabel"],
+[data-testid="stCheckbox"] label p, [data-testid="stRadio"] label p {
+    color: $page_text !important;
+}
+[data-testid="stExpander"] {
+    background-color: $section_bg;
+    border-radius: 10px;
+}
+[data-testid="stExpander"] summary p {
+    color: $page_text !important;
+}
+
+/* Native input/control chrome — Streamlit bakes these to its own detected
+   OS/browser theme, not this app's custom CSS, so they need explicit
+   overrides to actually follow the Dark/Light toggle. */
+[data-testid="stBaseButton-secondary"],
+[data-testid="stBaseButton-primary"],
+[data-testid="stFileUploader"] button {
+    background-color: $widget_bg !important;
+    color: $page_text !important;
+    border: 1px solid $widget_border !important;
+}
+[data-testid="stFileUploaderDropzone"] {
+    background-color: $widget_bg !important;
+    border: 1px dashed $widget_border !important;
+}
+[data-testid="stFileUploaderDropzone"] * {
+    color: $page_text !important;
+}
+[data-testid="stTextInput"] input,
+[data-testid="stNumberInput"] input,
+[data-testid="stTextArea"] textarea,
+[data-testid="stSelectbox"] div[data-baseweb="select"] > div,
+[data-testid="stMultiSelect"] div[data-baseweb="select"] > div {
+    background-color: $widget_bg !important;
+    color: $page_text !important;
+    border-color: $widget_border !important;
+}
+[data-testid="stSelectbox"] div[data-baseweb="select"] span,
+[data-testid="stMultiSelect"] div[data-baseweb="select"] span {
+    color: $page_text !important;
+}
+[data-testid="stTabs"] button p {
+    color: $subtext !important;
+}
+[data-testid="stTabs"] button[aria-selected="true"] p {
+    color: $page_text !important;
+}
+[data-testid="stDataFrame"] {
+    background-color: $widget_bg;
+    border: 1px solid $widget_border;
+}
+[data-testid="stAlert"] {
+    border: 1px solid $alert_border;
+}
+
+/* Tooltips and dropdown menus (BaseWeb) are rendered in a portal appended
+   near <body>, outside the themed app container, so they need their own
+   explicit overrides — they don't inherit anything from the rules above. */
+[data-baseweb="tooltip"] {
+    background-color: transparent !important;
+    color: $page_text !important;
+}
+[data-baseweb="tooltip"] > div {
+    background-color: $widget_bg !important;
+    border: 1px solid $widget_border !important;
+}
+[data-baseweb="tooltip"] * {
+    color: $page_text !important;
+}
+[data-baseweb="popover"] {
+    background-color: $widget_bg !important;
+    border: 1px solid $widget_border !important;
+    color: $page_text !important;
+}
+[data-baseweb="popover"] * {
+    color: $page_text !important;
+}
+[data-baseweb="menu"] li:hover,
+[data-baseweb="popover"] li[aria-selected="true"] {
+    background-color: $section_bg !important;
+}
+
 /* Main header */
 .main-header {
-    background: linear-gradient(135deg, #1e1b4b 0%, #312e81 50%, #4338ca 100%);
+    background: linear-gradient(135deg, $grad1 0%, $grad2 50%, $grad3 100%);
     padding: 1.5rem 2rem;
     border-radius: 12px;
     margin-bottom: 1.5rem;
     box-shadow: 0 8px 32px rgba(67, 56, 202, 0.3);
 }
 .main-header h1 {
-    color: #e0e7ff;
+    color: $header_text;
     font-size: 1.8rem;
     font-weight: 700;
     margin: 0;
     letter-spacing: -0.02em;
 }
 .main-header p {
-    color: #a5b4fc;
+    color: $subtext;
     font-size: 0.9rem;
     margin: 0.3rem 0 0 0;
 }
@@ -180,7 +315,7 @@ html, body, [class*="st-"] {
     flex: 1;
     height: 4px;
     border-radius: 2px;
-    background: #1e1b4b;
+    background: $step_dot_idle;
     transition: background 0.3s ease;
 }
 .step-dot.active {
@@ -193,8 +328,8 @@ html, body, [class*="st-"] {
 
 /* Metric cards */
 .metric-card {
-    background: linear-gradient(135deg, #1e1b4b, #312e81);
-    border: 1px solid #4338ca;
+    background: linear-gradient(135deg, $grad1, $grad2);
+    border: 1px solid $grad3;
     border-radius: 10px;
     padding: 1rem 1.2rem;
     text-align: center;
@@ -205,14 +340,14 @@ html, body, [class*="st-"] {
     box-shadow: 0 8px 24px rgba(99, 102, 241, 0.25);
 }
 .metric-card .label {
-    color: #a5b4fc;
+    color: $subtext;
     font-size: 0.75rem;
     font-weight: 500;
     text-transform: uppercase;
     letter-spacing: 0.05em;
 }
 .metric-card .value {
-    color: #e0e7ff;
+    color: $value_text;
     font-size: 1.4rem;
     font-weight: 700;
     margin-top: 0.25rem;
@@ -223,7 +358,7 @@ html, body, [class*="st-"] {
 
 /* Section card */
 .section-card {
-    background: rgba(30, 27, 75, 0.4);
+    background: $section_bg;
     border: 1px solid rgba(99, 102, 241, 0.2);
     border-radius: 10px;
     padding: 1.2rem;
@@ -232,7 +367,7 @@ html, body, [class*="st-"] {
 
 /* Sidebar refinements */
 section[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #0f0a2e 0%, #1e1b4b 100%);
+    background: linear-gradient(180deg, $sidebar1 0%, $sidebar2 100%);
 }
 section[data-testid="stSidebar"] .stRadio label {
     font-size: 0.92rem;
@@ -241,13 +376,13 @@ section[data-testid="stSidebar"] .stRadio label {
 }
 
 /* Buttons */
-.stButton > button {
+.stButton button {
     border-radius: 8px;
     font-weight: 600;
     letter-spacing: 0.02em;
     transition: all 0.2s ease;
 }
-.stButton > button:hover {
+.stButton button:hover {
     transform: translateY(-1px);
     box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
 }
@@ -261,8 +396,8 @@ section[data-testid="stSidebar"] .stRadio label {
 /* Info cards */
 .info-pill {
     display: inline-block;
-    background: rgba(99, 102, 241, 0.15);
-    color: #a5b4fc;
+    background: $pill_bg;
+    color: $subtext;
     padding: 0.3rem 0.8rem;
     border-radius: 20px;
     font-size: 0.8rem;
@@ -292,7 +427,7 @@ section[data-testid="stSidebar"] .stRadio label {
 [data-testid="stExpander"] details summary > span > span:first-child::before {
     content: '▶';
     font-size: 0.7rem;
-    color: #a5b4fc;
+    color: $subtext;
     display: inline-block;
     transition: transform 0.2s ease;
     margin-right: 2px;
@@ -321,7 +456,7 @@ section[data-testid="stSidebar"] .stRadio label {
 
 /* Sidebar label visibility */
 section[data-testid="stSidebar"] .stRadio > label {
-    color: #c7d2fe !important;
+    color: $sidebar_label !important;
     font-size: 0.85rem;
     font-weight: 600;
     letter-spacing: 0.04em;
@@ -352,13 +487,19 @@ section[data-testid="stSidebar"] .stRadio > label {
 }
 
 /* Compact download buttons */
-.stDownloadButton > button {
+.stDownloadButton button {
     padding: 0.3rem 0.8rem;
     font-size: 0.82rem;
     min-height: 2rem;
 }
 </style>
-"""
+""")
+
+
+def _build_custom_css(theme: str) -> str:
+    """Render the premium CSS block for the given theme ('dark' or 'light')."""
+    tokens = _PALETTES.get(theme, _PALETTES["dark"])
+    return _CUSTOM_CSS_TEMPLATE.safe_substitute(tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +507,8 @@ section[data-testid="stSidebar"] .stRadio > label {
 # ---------------------------------------------------------------------------
 
 def inject_css():
-    st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+    theme = st.session_state.get("theme", "dark")
+    st.markdown(_build_custom_css(theme), unsafe_allow_html=True)
 
 
 def render_header():
@@ -472,7 +614,11 @@ def _chart_customization(key_prefix: str, default_title: str, default_x: str, de
 
 def _display_chart_with_downloads(fig, source_df, key: str, filename_prefix: str):
     """Display a Plotly chart with PNG and source-data CSV download buttons."""
-    st.plotly_chart(fig, width='stretch')
+    template = "plotly_dark" if st.session_state.get("theme", "dark") == "dark" else "plotly_white"
+    fig.update_layout(template=template)
+    # theme=None: use the figure's own template instead of Streamlit's auto-detected
+    # light/dark theme, which would otherwise silently override it.
+    st.plotly_chart(fig, width='stretch', theme=None)
     render_chart_download(fig, source_df, key=key, filename_prefix=filename_prefix)
 
 
@@ -558,6 +704,7 @@ def cached_train_prepared(prepared_df, target_column, cfg_text, feature_subset_j
 def init_state():
     defaults = {
         "current_step": STEPS[0],
+        "theme": "dark",
         "config": None,
         "input_label": None,
         "data_outputs": None,
@@ -606,6 +753,59 @@ _DOWNSTREAM_FROM_ALIGNMENT = (
     "eda_outputs", "modeling_outputs", "post_analysis_outputs", "export_bundle",
 )
 _DOWNSTREAM_FROM_MODELING = ("post_analysis_outputs", "export_bundle")
+
+
+def _sync_native_theme(theme: str) -> None:
+    """Best-effort sync of Streamlit's own native theme (Settings menu) to match
+    our custom toggle.
+
+    Canvas-rendered widgets (st.dataframe's grid) draw their own pixels from
+    Streamlit's internal theme engine, not CSS — no stylesheet can reach them.
+    Streamlit's native Settings menu is the only thing that actually re-themes
+    them, so we drive it programmatically: open the main menu, click the
+    matching Light/Dark menu item, close the menu again. This depends on
+    Streamlit's internal localStorage key and menu DOM structure (not public
+    API) and no-ops safely if either is missing or already correct.
+    """
+    desired = "Light" if theme == "light" else "Dark"
+    js = """
+    <script>
+    (function() {
+        const desired = "__DESIRED__";
+        const win = window.parent;
+        const doc = win.document;
+        let current = null;
+        try { current = win.localStorage.getItem('stActiveTheme-/-v2'); } catch (e) {}
+        if (current === JSON.stringify(desired)) { return; }
+        const menuBtn = doc.querySelector('[data-testid="stMainMenuButton"]');
+        if (!menuBtn) return;
+        menuBtn.click();
+        setTimeout(function() {
+            const items = Array.from(doc.querySelectorAll('[role="menuitemradio"]'));
+            const target = items.find(function(el) { return el.textContent.trim().endsWith(desired); });
+            if (target) { target.click(); }
+            setTimeout(function() {
+                const stillOpen = doc.querySelectorAll('[role="menuitemradio"]').length > 0;
+                if (stillOpen) { menuBtn.click(); }
+            }, 200);
+        }, 250);
+    })();
+    </script>
+    """.replace("__DESIRED__", desired)
+    components.html(js, height=0, width=0)
+
+
+def _render_theme_toggle():
+    """Sidebar Dark/Light toggle — must run before inject_css() each rerun."""
+    choice = st.sidebar.radio(
+        "Theme",
+        ["Dark", "Light"],
+        index=0 if st.session_state.theme == "dark" else 1,
+        horizontal=True,
+        key="theme_radio",
+    )
+    st.session_state.theme = choice.lower()
+    _sync_native_theme(st.session_state.theme)
 
 
 def step_nav() -> str:
@@ -2515,9 +2715,10 @@ def main():
         layout="wide",
         initial_sidebar_state="expanded",
     )
+    init_state()
+    _render_theme_toggle()
     inject_css()
     render_header()
-    init_state()
 
     st.session_state.current_step = step_nav()
     current_idx = STEPS.index(st.session_state.current_step)
