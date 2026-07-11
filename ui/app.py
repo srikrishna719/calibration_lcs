@@ -498,7 +498,7 @@ section[data-testid="stSidebar"] .stRadio > label {
 
 def _build_custom_css(theme: str) -> str:
     """Render the premium CSS block for the given theme ('dark' or 'light')."""
-    tokens = _PALETTES.get(theme, _PALETTES["dark"])
+    tokens = _PALETTES.get(theme, _PALETTES["light"])
     return _CUSTOM_CSS_TEMPLATE.safe_substitute(tokens)
 
 
@@ -507,7 +507,7 @@ def _build_custom_css(theme: str) -> str:
 # ---------------------------------------------------------------------------
 
 def inject_css():
-    theme = st.session_state.get("theme", "dark")
+    theme = st.session_state.get("theme", "light")
     st.markdown(_build_custom_css(theme), unsafe_allow_html=True)
 
 
@@ -614,7 +614,7 @@ def _chart_customization(key_prefix: str, default_title: str, default_x: str, de
 
 def _display_chart_with_downloads(fig, source_df, key: str, filename_prefix: str):
     """Display a Plotly chart with PNG and source-data CSV download buttons."""
-    template = "plotly_dark" if st.session_state.get("theme", "dark") == "dark" else "plotly_white"
+    template = "plotly_dark" if st.session_state.get("theme", "light") == "dark" else "plotly_white"
     fig.update_layout(template=template)
     # theme=None: use the figure's own template instead of Streamlit's auto-detected
     # light/dark theme, which would otherwise silently override it.
@@ -704,7 +704,7 @@ def cached_train_prepared(prepared_df, target_column, cfg_text, feature_subset_j
 def init_state():
     defaults = {
         "current_step": STEPS[0],
-        "theme": "dark",
+        "theme": "light",
         "config": None,
         "input_label": None,
         "data_outputs": None,
