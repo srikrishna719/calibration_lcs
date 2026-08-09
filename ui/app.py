@@ -1,4 +1,4 @@
-"""Premium 8-step Streamlit UI for the Air Quality Sensor Calibration Lab.
+"""Premium Streamlit UI for CaliSenseAQ.
 
 Provides a refined, research-grade workflow with extensive user controls,
 dark-themed premium styling, and interactive Plotly visualisations.
@@ -7,6 +7,7 @@ dark-themed premium styling, and interactive Plotly visualisations.
 from __future__ import annotations
 
 import json
+import io
 import sys
 from pathlib import Path
 from string import Template
@@ -45,6 +46,18 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from ui.demo_workflow import (
+    build_sample_demo_state,
+    history_as_dataframe,
+    make_run_history_entry,
+)
+from ui.workflow import (
+    APP_MODES,
+    next_step,
+    normalize_current_step,
+    suggest_column_setup,
+    visible_steps,
+)
 from models.predict import predict_with_model
 from models.model_registry import MODEL_GROUPS, MODEL_DISPLAY_NAMES
 from modules.drift_analysis import (
@@ -514,8 +527,8 @@ def inject_css():
 def render_header():
     st.markdown(
         '<div class="main-header">'
-        '<h1>🌬️ Air Quality Sensor Calibration Lab</h1>'
-        '<p>Research-grade calibration pipeline for low-cost air quality sensors</p>'
+        '<h1>CaliSenseAQ</h1>'
+        '<p>Calibration pipeline for low-cost air quality sensor data</p>'
         '</div>',
         unsafe_allow_html=True,
     )
@@ -523,7 +536,8 @@ def render_header():
 
 def render_step_progress(current_index: int):
     dots = ""
-    for i in range(len(STEPS)):
+    total_steps = len(visible_steps(STEPS, STEP_KEYS, st.session_state.get("app_mode", "Basic")))
+    for i in range(total_steps):
         cls = "done" if i < current_index else ("active" if i == current_index else "")
         dots += f'<div class="step-dot {cls}"></div>'
     st.markdown(f'<div class="step-progress">{dots}</div>', unsafe_allow_html=True)
@@ -622,6 +636,24 @@ def _display_chart_with_downloads(fig, source_df, key: str, filename_prefix: str
     render_chart_download(fig, source_df, key=key, filename_prefix=filename_prefix)
 
 
+def _prediction_frame(result, scope: str) -> pd.DataFrame:
+    """Return validation or full fitted predictions for a training result."""
+    if scope == "validation":
+        validation = getattr(result, "validation_predictions", None)
+        if isinstance(validation, pd.DataFrame) and not validation.empty:
+            return validation.copy()
+        test_predictions = getattr(result, "test_predictions", None)
+        if isinstance(test_predictions, pd.DataFrame) and not test_predictions.empty:
+            return test_predictions.copy()
+    return result.full_predictions.copy()
+
+
+def _prediction_scope_caption(scope: str) -> str:
+    if scope == "validation":
+        return "Showing validation predictions. These are the predictions used for leaderboard metrics."
+    return "Showing full fitted predictions from the final model refit on all available modelling rows."
+
+
 def _normalization_summary_tables(summary: pd.DataFrame):
     """Split normalization summary into before/after display tables."""
     before_cols = [c for c in summary.columns if c.startswith("before_") or c == "column"]
@@ -642,6 +674,62 @@ def _parse_positive_int_list(text: str) -> list:
                 raise ValueError(f"Expected positive integer, got {val}")
             result.append(val)
     return result
+
+
+def is_advanced_mode() -> bool:
+    return st.session_state.get("app_mode", "Basic") == "Advanced"
+
+
+def _uploaded_csv_columns(uploaded_file) -> list[str]:
+    if uploaded_file is None:
+        return []
+    try:
+        return pd.read_csv(io.BytesIO(uploaded_file.getvalue()), nrows=0).columns.tolist()
+    except Exception:
+        return []
+
+
+def _apply_basic_feature_defaults(fe_config: dict) -> None:
+    fe_config["rolling_windows"] = []
+    fe_config["rolling_std"] = False
+    fe_config["polynomial_degree"] = 1
+    fe_config["polynomial_columns"] = []
+    fe_config["interaction_columns"] = []
+    fe_config["add_time_features"] = False
+    fe_config["time_feature_flags"] = {}
+
+
+def _record_run_history(source: str) -> None:
+    if st.session_state.modeling_outputs is None or st.session_state.config is None:
+        return
+    entry = make_run_history_entry(
+        modeling_outputs=st.session_state.modeling_outputs,
+        config=st.session_state.config,
+        source=source,
+        selected_features=st.session_state.selected_features,
+    )
+    history = list(st.session_state.get("run_history", []))
+    history.append(entry)
+    st.session_state.run_history = history[-25:]
+
+
+def _render_run_history(key_prefix: str = "run_history") -> None:
+    history = st.session_state.get("run_history", [])
+    if not history:
+        st.caption("No saved runs yet. Train a model or run the sample demo to create the first entry.")
+        return
+
+    history_df = history_as_dataframe(history)
+    st.dataframe(_format_metric_dataframe(history_df), width='stretch')
+    render_df_download(history_df, key=f"{key_prefix}_csv", filename="run_history.csv")
+    st.download_button(
+        "Download run history JSON",
+        data=_cfg_to_json(history).encode("utf-8"),
+        file_name="run_history.json",
+        mime="application/json",
+        key=f"{key_prefix}_json",
+        width='stretch',
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -704,6 +792,7 @@ def cached_train_prepared(prepared_df, target_column, cfg_text, feature_subset_j
 def init_state():
     defaults = {
         "current_step": STEPS[0],
+        "app_mode": "Basic",
         "theme": "light",
         "config": None,
         "input_label": None,
@@ -720,8 +809,11 @@ def init_state():
         "variable_selection_outputs": None,
         "feature_engineering_outputs": None,
         "normalization_outputs": None,
+        "diagnostics_outputs": None,
+        "post_analysis_outputs": None,
         "residual_analysis_outputs": None,
         "export_bundle": None,
+        "run_history": [],
         # Feature engineering extras
         "featured_preview": None,
         "selected_features": None,
@@ -743,16 +835,27 @@ def _reset_downstream(*keys: str):
 # Common downstream reset groups
 _DOWNSTREAM_FROM_UPLOAD = (
     "preprocessing_outputs", "alignment_outputs", "eda_outputs",
-    "modeling_outputs", "post_analysis_outputs", "export_bundle",
+    "selected_target", "selected_predictors", "selected_model_name",
+    "variable_selection_outputs", "feature_engineering_outputs", "normalization_outputs",
+    "modeling_outputs", "diagnostics_outputs", "post_analysis_outputs",
+    "residual_analysis_outputs", "export_bundle", "featured_preview", "selected_features",
 )
 _DOWNSTREAM_FROM_PREPROCESSING = (
-    "alignment_outputs", "eda_outputs", "modeling_outputs",
-    "post_analysis_outputs", "export_bundle",
+    "alignment_outputs", "eda_outputs", "selected_target", "selected_predictors",
+    "selected_model_name", "variable_selection_outputs", "feature_engineering_outputs",
+    "normalization_outputs", "modeling_outputs", "diagnostics_outputs",
+    "post_analysis_outputs", "residual_analysis_outputs", "export_bundle",
+    "featured_preview", "selected_features",
 )
 _DOWNSTREAM_FROM_ALIGNMENT = (
-    "eda_outputs", "modeling_outputs", "post_analysis_outputs", "export_bundle",
+    "eda_outputs", "selected_target", "selected_predictors", "selected_model_name",
+    "variable_selection_outputs", "feature_engineering_outputs", "normalization_outputs",
+    "modeling_outputs", "diagnostics_outputs", "post_analysis_outputs",
+    "residual_analysis_outputs", "export_bundle", "featured_preview", "selected_features",
 )
-_DOWNSTREAM_FROM_MODELING = ("post_analysis_outputs", "export_bundle")
+_DOWNSTREAM_FROM_MODELING = (
+    "diagnostics_outputs", "post_analysis_outputs", "residual_analysis_outputs", "export_bundle"
+)
 
 
 def _sync_native_theme(theme: str) -> None:
@@ -808,14 +911,40 @@ def _render_theme_toggle():
     _sync_native_theme(st.session_state.theme)
 
 
+def _render_mode_toggle():
+    choice = st.sidebar.radio(
+        "Mode",
+        list(APP_MODES),
+        index=list(APP_MODES).index(st.session_state.get("app_mode", "Basic"))
+        if st.session_state.get("app_mode", "Basic") in APP_MODES else 0,
+        horizontal=True,
+        key="app_mode_radio",
+        help="Basic keeps the guided workflow compact. Advanced shows diagnostics and expert controls.",
+    )
+    st.session_state.app_mode = choice
+
+
 def step_nav() -> str:
-    return st.sidebar.radio("Workflow Steps", STEPS, index=STEPS.index(st.session_state.current_step))
+    current = normalize_current_step(
+        st.session_state.current_step,
+        STEPS,
+        STEP_KEYS,
+        st.session_state.get("app_mode", "Basic"),
+    )
+    st.session_state.current_step = current
+    steps = visible_steps(STEPS, STEP_KEYS, st.session_state.get("app_mode", "Basic"))
+    return st.sidebar.radio("Workflow Steps", steps, index=steps.index(current))
 
 
 def go_next():
-    idx = STEPS.index(st.session_state.current_step)
-    if idx < len(STEPS) - 1:
-        st.session_state.current_step = STEPS[idx + 1]
+    next_label = next_step(
+        st.session_state.current_step,
+        STEPS,
+        STEP_KEYS,
+        st.session_state.get("app_mode", "Basic"),
+    )
+    if next_label != st.session_state.current_step:
+        st.session_state.current_step = next_label
         st.rerun()
 
 
@@ -847,7 +976,7 @@ def render_upload():
     st.subheader("📤 Upload Data")
     st.markdown(
         "Upload your **reference-grade instrument** CSV and **low-cost sensor (LCS)** CSV datasets. "
-        "Both files must share a common timestamp column so they can be aligned in the next step."
+        "Both files need a shared date/time column so rows can be matched during alignment."
     )
 
     col1, col2 = st.columns(2)
@@ -874,16 +1003,18 @@ def render_upload():
             ),
         )
 
-    cfg_file = st.file_uploader(
-        "Optional: Custom Config (YAML/JSON)",
-        type=["yaml", "yml", "json"],
-        key="cfg_upload",
-        help=(
-            "Upload a previously saved config file to pre-fill all pipeline settings. "
-            "Leave empty to use the built-in defaults (recommended for first-time use). "
-            "A config is automatically generated and downloadable from the Export step."
-        ),
-    )
+    cfg_file = None
+    if is_advanced_mode():
+        with st.expander("Advanced import settings", expanded=False):
+            cfg_file = st.file_uploader(
+                "Load saved settings (YAML/JSON)",
+                type=["yaml", "yml", "json"],
+                key="cfg_upload",
+                help=(
+                    "Optional. Load a previously exported settings file to pre-fill pipeline choices. "
+                    "Leave empty for the default guided workflow."
+                ),
+            )
     use_sample = st.checkbox(
         "Use bundled sample datasets",
         value=True,
@@ -892,6 +1023,30 @@ def render_upload():
             "Uncheck this once you have your own CSV files uploaded above."
         ),
     )
+
+    if st.button(
+        "Run all steps with sample data",
+        key="run_sample_demo_workflow",
+        width='stretch',
+        help="Runs the bundled sample data through loading, cleaning, alignment, EDA, preparation, normalization, and modelling.",
+    ):
+        with st.spinner("Running sample workflow..."):
+            try:
+                ref_demo, sen_demo = cached_load_sample()
+                demo_state = build_sample_demo_state(ref_demo, sen_demo, resolve_config(cfg_file))
+                for state_key, state_value in demo_state.items():
+                    st.session_state[state_key] = state_value
+                _reset_downstream(
+                    "diagnostics_outputs",
+                    "post_analysis_outputs",
+                    "residual_analysis_outputs",
+                    "export_bundle",
+                )
+                _record_run_history("Sample demo workflow")
+                st.session_state.current_step = STEPS[8]
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ {e}")
 
     # Preview
     with st.expander("👀 Preview bundled sample datasets"):
@@ -902,18 +1057,43 @@ def render_upload():
         c2.caption("LCS (first 10 rows)")
         c2.dataframe(s.head(10), width='stretch')
 
-    # Config customisation
-    with st.expander("⚙️ Data Configuration"):
+    # Required column setup
+    with st.expander("Column setup", expanded=True):
         st.caption(
-            "Tell the pipeline which columns contain the timestamp and the target pollutant. "
-            "These names must match exactly what's in your CSV headers."
+            "Confirm which columns contain the shared timestamp and reference pollutant. "
+            "These names must match the CSV headers exactly."
         )
         config = resolve_config(cfg_file)
         data_cfg = config.get("data", {})
+        if ref_file is not None and sen_file is not None:
+            ref_columns = _uploaded_csv_columns(ref_file)
+            sen_columns = _uploaded_csv_columns(sen_file)
+        elif use_sample:
+            sample_ref, sample_sen = cached_load_sample()
+            ref_columns = sample_ref.columns.tolist()
+            sen_columns = sample_sen.columns.tolist()
+        else:
+            ref_columns, sen_columns = [], []
+        suggested_ts, suggested_target = suggest_column_setup(
+            ref_columns,
+            sen_columns,
+            configured_timestamp=data_cfg.get("timestamp_column", "timestamp"),
+            configured_target=data_cfg.get("target_column", "pm25"),
+        )
+        column_signature = (
+            tuple(ref_columns),
+            tuple(sen_columns),
+            data_cfg.get("timestamp_column", "timestamp"),
+            data_cfg.get("target_column", "pm25"),
+        )
+        if st.session_state.get("column_setup_signature") != column_signature:
+            st.session_state.upload_ts_col = suggested_ts
+            st.session_state.upload_target_col = suggested_target
+            st.session_state.column_setup_signature = column_signature
         c1, c2, c3 = st.columns(3)
         ts_col = c1.text_input(
-            "Timestamp column",
-            value=data_cfg.get("timestamp_column", "timestamp"),
+            "Shared timestamp column",
+            key="upload_ts_col",
             help=(
                 "Exact column name containing the date/time in both CSV files. "
                 "Must be identical in the reference and sensor CSVs. "
@@ -922,7 +1102,7 @@ def render_upload():
         )
         target_col = c2.text_input(
             "Target column (reference)",
-            value=data_cfg.get("target_column", "pm25"),
+            key="upload_target_col",
             help=(
                 "The pollutant column in the **reference** CSV that you are calibrating the sensor against. "
                 "Example: 'pm25', 'pm2_5', 'no2', 'o3'. "
@@ -1211,18 +1391,28 @@ def render_alignment():
                 "• **min/max** — for peak or trough analysis"
             ),
         )
-        merge_strategy = c3.selectbox(
-            "Merge strategy",
-            ["inner", "nearest"],
-            index=0,
+        merge_options = {
+            "Exact timestamp match": "inner",
+            "Nearest timestamp match": "nearest",
+        }
+        current_merge = str(config["alignment"].get("merge_strategy", "inner"))
+        current_merge_label = next(
+            (label for label, value in merge_options.items() if value == current_merge),
+            "Exact timestamp match",
+        )
+        merge_label = c3.selectbox(
+            "Timestamp matching",
+            list(merge_options.keys()),
+            index=list(merge_options.keys()).index(current_merge_label),
             help=(
-                "• **inner** — keeps only timestamps that exist in **both** datasets "
-                "(exact match after resampling). Safest — no interpolation across gaps.\n"
-                "• **nearest** — matches each sensor timestamp to the closest reference "
-                "timestamp (merge_asof). Useful when clocks are slightly offset but "
+                "• **Exact timestamp match** keeps only times found in both datasets "
+                "after resampling. This is the safest default.\n"
+                "• **Nearest timestamp match** pairs each sensor time with the closest "
+                "reference time. Useful when clocks are slightly offset, but it "
                 "may pair non-simultaneous readings."
             ),
         )
+        merge_strategy = merge_options[merge_label]
         max_lag = c4.number_input(
             "Max lag steps",
             min_value=0, max_value=24,
@@ -1284,6 +1474,7 @@ def render_eda():
         return
 
     merged = st.session_state.alignment_outputs["merged_data"]
+    ts_col = st.session_state.config["data"]["timestamp_column"]
 
     if st.button("🚀 Generate EDA", key="run_eda", width='stretch'):
         with st.spinner("Analysing data…"):
@@ -1298,9 +1489,9 @@ def render_eda():
     out = st.session_state.eda_outputs
     if out is not None:
         tabs = st.tabs(["📈 Distributions", "🔥 Correlations", "❓ Missing Values", "📉 Time Series", "⚠️ Anomalies"])
+        numeric_cols = out.get("numeric_columns", [])
 
         with tabs[0]:
-            numeric_cols = out.get("numeric_columns", [])
             if numeric_cols:
                 sel_col = st.selectbox("Select column", numeric_cols, key="eda_distcol")
                 from modules.eda import create_distribution_figure
@@ -1326,6 +1517,10 @@ def render_eda():
             )
 
         with tabs[2]:
+            title, x_label, y_label = _chart_customization(
+                "eda_missing", "Missing Values by Timestamp", "Timestamp", "Column"
+            )
+            out["missing_heatmap"].update_layout(title=title, xaxis_title=x_label, yaxis_title=y_label)
             _display_chart_with_downloads(
                 out["missing_heatmap"], out.get("missing_summary"),
                 key="eda_missing", filename_prefix="missing_heatmap",
@@ -1334,21 +1529,70 @@ def render_eda():
             render_df_download(out["missing_summary"], key="eda_missing_csv", filename="missing_summary.csv")
 
         with tabs[3]:
-            _display_chart_with_downloads(
-                out["time_series_figure"], merged, key="eda_ts", filename_prefix="time_series",
+            ts_options = [c for c in numeric_cols if c != ts_col]
+            selected_ts_cols = st.multiselect(
+                "Variables to plot",
+                ts_options,
+                default=ts_options[: min(4, len(ts_options))],
+                key="eda_ts_cols",
+                help="Choose one or more numeric variables to display over time.",
             )
+            if not selected_ts_cols:
+                st.warning("Select at least one variable to plot.")
+            else:
+                from modules.eda import create_time_series_figure
+                fig_ts = create_time_series_figure(merged, ts_col, selected_ts_cols)
+                title, x_label, y_label = _chart_customization(
+                    "eda_ts", "Time-Series Overview", "Time", "Value"
+                )
+                fig_ts.update_layout(title=title, xaxis_title=x_label, yaxis_title=y_label)
+                source_ts = merged[[ts_col] + selected_ts_cols].copy()
+                _display_chart_with_downloads(
+                    fig_ts, source_ts, key="eda_ts", filename_prefix="time_series",
+                )
 
         with tabs[4]:
-            _display_chart_with_downloads(
-                out["anomaly_figure"], out.get("anomalies"), key="eda_anomaly",
-                filename_prefix="anomalies",
+            st.caption(
+                "Z-score anomaly check: a row is flagged when the selected variable is more "
+                "than the chosen number of standard deviations from its mean."
             )
-            if not out["anomalies"].empty:
-                st.caption(f"Detected {len(out['anomalies'])} anomalous rows")
-                st.dataframe(out["anomalies"].head(25), width='stretch')
-                render_df_download(out["anomalies"], key="eda_anomalies_csv", filename="anomalies.csv")
+            anomaly_options = [c for c in numeric_cols if c != ts_col]
+            if not anomaly_options:
+                st.info("No numeric variables are available for anomaly checking.")
             else:
-                st.success("No anomalies detected.")
+                c1, c2 = st.columns([2, 1])
+                anomaly_col = c1.selectbox("Variable to check", anomaly_options, key="eda_anomaly_col")
+                threshold = c2.number_input(
+                    "Z-score threshold",
+                    min_value=1.0,
+                    max_value=10.0,
+                    value=3.0,
+                    step=0.5,
+                    key="eda_anomaly_threshold",
+                    help="Higher values flag fewer rows. 3.0 is a common starting point.",
+                )
+                from modules.eda import create_anomaly_figure, detect_basic_anomalies
+                anomalies = detect_basic_anomalies(merged, [anomaly_col], threshold=float(threshold))
+                fig_anomaly = create_anomaly_figure(
+                    dataframe=merged,
+                    timestamp_column=ts_col,
+                    value_column=anomaly_col,
+                    anomalies=anomalies,
+                )
+                title, x_label, y_label = _chart_customization(
+                    "eda_anomaly", f"Z-score Anomaly Check - {anomaly_col}", "Time", anomaly_col
+                )
+                fig_anomaly.update_layout(title=title, xaxis_title=x_label, yaxis_title=y_label)
+                _display_chart_with_downloads(
+                    fig_anomaly, anomalies, key="eda_anomaly",
+                    filename_prefix="anomalies",
+                )
+                if not anomalies.empty:
+                    st.caption(f"Detected {len(anomalies)} anomalous rows")
+                    st.dataframe(anomalies.head(25), width='stretch')
+                    render_df_download(anomalies, key="eda_anomalies_csv", filename="anomalies.csv")
+                else:
+                    st.success("No anomalies detected for the selected variable and threshold.")
 
         if st.button("Next ➡️", key="next_eda", width='stretch'):
             go_next()
@@ -1439,95 +1683,106 @@ def render_feature_engineering():
     )
 
     fe_config = config.setdefault("feature_engineering", {})
+    advanced_mode = is_advanced_mode()
+    if not advanced_mode:
+        _apply_basic_feature_defaults(fe_config)
+        st.caption("Basic mode keeps advanced feature expansion off. Switch to Advanced to add rolling, polynomial, interaction, or time features.")
 
-    with st.expander("\u23f3 Lag Features", expanded=False):
+    with st.expander("Lag features", expanded=False):
         lag_steps_str = st.text_input(
             "Lag steps (comma-separated)",
-            value=",".join(str(s) for s in fe_config.get("lag_steps", [1, 2, 3])),
+            value=",".join(str(s) for s in fe_config.get("lag_steps", [])),
             key="fe_lag_steps",
             help="Integers representing how many time-steps back to look.",
-        )
-        rolling_str = st.text_input(
-            "Rolling windows (comma-separated)",
-            value=",".join(str(w) for w in fe_config.get("rolling_windows", [3, 6])),
-            key="fe_rolling_windows",
-            help="Window sizes for rolling mean/std.",
-        )
-        rolling_std = st.checkbox(
-            "Include rolling std",
-            value=bool(fe_config.get("rolling_std", True)),
-            key="fe_rolling_std",
         )
         try:
             fe_config["lag_steps"] = _parse_positive_int_list(lag_steps_str)
         except ValueError:
             st.warning("Invalid lag steps.")
-        try:
-            fe_config["rolling_windows"] = _parse_positive_int_list(rolling_str)
-        except ValueError:
-            st.warning("Invalid rolling windows.")
-        fe_config["rolling_std"] = rolling_std
 
-    with st.expander("\U0001f4d0 Polynomial & Interaction Features", expanded=False):
-        poly_degree = st.selectbox(
-            "Polynomial degree", [1, 2, 3],
-            index=[1, 2, 3].index(int(fe_config.get("polynomial_degree", 1))),
-            key="fe_poly_degree",
-        )
-        poly_cols = st.multiselect(
-            "Columns for polynomial expansion",
-            sensor_base_cols,
-            default=[c for c in fe_config.get("polynomial_columns", []) if c in sensor_base_cols],
-            key="fe_poly_cols",
-        )
-        interaction_cols = st.multiselect(
-            "Columns for pairwise interaction",
-            sensor_base_cols,
-            default=[c for c in fe_config.get("interaction_columns", []) if c in sensor_base_cols],
-            key="fe_interaction_cols",
-        )
-        fe_config["polynomial_degree"] = poly_degree
-        fe_config["polynomial_columns"] = poly_cols
-        fe_config["interaction_columns"] = interaction_cols
+    if advanced_mode:
+        with st.expander("Advanced rolling features", expanded=False):
+            rolling_str = st.text_input(
+                "Rolling windows (comma-separated)",
+                value=",".join(str(w) for w in fe_config.get("rolling_windows", [])),
+                key="fe_rolling_windows",
+                help="Optional moving-window means/std values. Leave empty to skip rolling features.",
+            )
+            rolling_std = st.checkbox(
+                "Include rolling std",
+                value=bool(fe_config.get("rolling_std", False)),
+                key="fe_rolling_std",
+            )
+            try:
+                fe_config["rolling_windows"] = _parse_positive_int_list(rolling_str)
+            except ValueError:
+                st.warning("Invalid rolling windows.")
+            fe_config["rolling_std"] = rolling_std
 
-    with st.expander("\u23f0 Time Features", expanded=False):
-        existing_tf = fe_config.get("time_feature_flags", {})
-        add_time = st.checkbox(
-            "Enable time features",
-            value=bool(fe_config.get("add_time_features", True)),
-            key="fe_add_time",
-            help="Adds hour-of-day, day-of-week, and day-of-month columns automatically. Extra features below are optional.",
-        )
-        fe_config["add_time_features"] = add_time
-        if add_time:
-            st.caption("Basic features (hour 0-23, day-of-week 0-6, day-of-month 1-31) always included. Enable extras:")
-            tc1, tc2, tc3 = st.columns(3)
-            tf = {"hour_of_day": True, "day_of_week": True, "day_of_month": True}
-            tf["unix_timestamp"] = tc1.checkbox("Unix timestamp", value=existing_tf.get("unix_timestamp", False), key="fe_tf_unix",
-                help="Seconds since 1970-01-01. Useful as a linear time trend proxy for tree models.")
-            tf["julian_date"] = tc1.checkbox("Julian date (DOY)", value=existing_tf.get("julian_date", False), key="fe_tf_julian",
-                help="Day-of-year (1-366). Captures seasonal variation without cyclical encoding.")
-            tf["calendar_date"] = tc1.checkbox("Calendar date (int)", value=existing_tf.get("calendar_date", False), key="fe_tf_caldate",
-                help="Integer days since 1970-01-01, day-resolution. Good for long-term trend.")
-            tf["cyclical_hour"] = tc2.checkbox("Cyclical hour sin/cos", value=existing_tf.get("cyclical_hour", False), key="fe_tf_cychour",
-                help="Encodes hour as sin/cos so hour 23 is treated as close to hour 0. Better than raw integer for linear models.")
-            tf["cyclical_dow"] = tc2.checkbox("Cyclical DOW sin/cos", value=existing_tf.get("cyclical_dow", False), key="fe_tf_cydow",
-                help="Circular day-of-week encoding. Sunday wraps around to Monday correctly.")
-            tf["cyclical_doy"] = tc2.checkbox("Cyclical DOY sin/cos", value=existing_tf.get("cyclical_doy", False), key="fe_tf_cydoy",
-                help="Circular day-of-year encoding. Dec 31 treated as adjacent to Jan 1.")
-            tf["season"] = tc3.checkbox("Season (DJF/MAM/JJA/SON)", value=existing_tf.get("season", False), key="fe_tf_season",
-                help="Meteorological season as 0-3: DJF(winter)=0, MAM(spring)=1, JJA(summer)=2, SON(autumn)=3.")
-            tf["day_name"] = tc3.checkbox("Day name & weekend flag", value=existing_tf.get("day_name", False), key="fe_tf_dayname",
-                help="Adds day-of-week number (0-6) and binary is_weekend (1=Sat/Sun). Traffic-related PM differs on weekends.")
-            fe_config["time_feature_flags"] = tf
+    if advanced_mode:
+        with st.expander("Advanced polynomial and interaction features", expanded=False):
+            poly_degree = st.selectbox(
+                "Polynomial degree", [1, 2, 3],
+                index=[1, 2, 3].index(int(fe_config.get("polynomial_degree", 1))),
+                key="fe_poly_degree",
+                help="Adds squared/cubic terms only. Pairwise products are controlled separately below.",
+            )
+            poly_cols = st.multiselect(
+                "Columns for squared/cubic terms",
+                sensor_base_cols,
+                default=[c for c in fe_config.get("polynomial_columns", []) if c in sensor_base_cols],
+                key="fe_poly_cols",
+            )
+            interaction_cols = st.multiselect(
+                "Columns for pairwise interaction",
+                sensor_base_cols,
+                default=[c for c in fe_config.get("interaction_columns", []) if c in sensor_base_cols],
+                key="fe_interaction_cols",
+            )
+            fe_config["polynomial_degree"] = poly_degree
+            fe_config["polynomial_columns"] = poly_cols
+            fe_config["interaction_columns"] = interaction_cols
+
+    if advanced_mode:
+        with st.expander("Advanced time features", expanded=False):
+            st.caption("Time features are appended after normalization so timestamp-derived columns are not scaled first.")
+            existing_tf = fe_config.get("time_feature_flags", {})
+            add_time = st.checkbox(
+                "Enable time features",
+                value=bool(fe_config.get("add_time_features", False)),
+                key="fe_add_time",
+                help="Adds hour-of-day, day-of-week, and day-of-month columns automatically. Extra features below are optional.",
+            )
+            fe_config["add_time_features"] = add_time
+            if add_time:
+                st.caption("Basic features (hour 0-23, day-of-week 0-6, day-of-month 1-31) always included. Enable extras:")
+                tc1, tc2, tc3 = st.columns(3)
+                tf = {"hour_of_day": True, "day_of_week": True, "day_of_month": True}
+                tf["unix_timestamp"] = tc1.checkbox("Unix timestamp", value=existing_tf.get("unix_timestamp", False), key="fe_tf_unix",
+                    help="Seconds since 1970-01-01. Useful as a linear time trend proxy for tree models.")
+                tf["julian_date"] = tc1.checkbox("Julian date (DOY)", value=existing_tf.get("julian_date", False), key="fe_tf_julian",
+                    help="Day-of-year (1-366). Captures seasonal variation without cyclical encoding.")
+                tf["calendar_date"] = tc1.checkbox("Calendar date (int)", value=existing_tf.get("calendar_date", False), key="fe_tf_caldate",
+                    help="Integer days since 1970-01-01, day-resolution. Good for long-term trend.")
+                tf["cyclical_hour"] = tc2.checkbox("Cyclical hour sin/cos", value=existing_tf.get("cyclical_hour", False), key="fe_tf_cychour",
+                    help="Encodes hour as sin/cos so hour 23 is treated as close to hour 0. Better than raw integer for linear models.")
+                tf["cyclical_dow"] = tc2.checkbox("Cyclical DOW sin/cos", value=existing_tf.get("cyclical_dow", False), key="fe_tf_cydow",
+                    help="Circular day-of-week encoding. Sunday wraps around to Monday correctly.")
+                tf["cyclical_doy"] = tc2.checkbox("Cyclical DOY sin/cos", value=existing_tf.get("cyclical_doy", False), key="fe_tf_cydoy",
+                    help="Circular day-of-year encoding. Dec 31 treated as adjacent to Jan 1.")
+                tf["season"] = tc3.checkbox("Season (DJF/MAM/JJA/SON)", value=existing_tf.get("season", False), key="fe_tf_season",
+                    help="Meteorological season as 0-3: DJF(winter)=0, MAM(spring)=1, JJA(summer)=2, SON(autumn)=3.")
+                tf["day_name"] = tc3.checkbox("Day name & weekend flag", value=existing_tf.get("day_name", False), key="fe_tf_dayname",
+                    help="Adds day-of-week number (0-6) and binary is_weekend (1=Sat/Sun). Traffic-related PM differs on weekends.")
+                fe_config["time_feature_flags"] = tf
 
     st.session_state.config = config
 
     if st.button("\U0001f680 Preview Features", key="preview_features", width='stretch'):
         with st.spinner("Engineering features..."):
             try:
-                from modules.feature_engineering import engineer_features
-                featured = engineer_features(
+                from modules.feature_engineering import engineer_sensor_features
+                featured = engineer_sensor_features(
                     dataframe=modelling_df,
                     timestamp_column=ts_col,
                     target_column=target_col,
@@ -1535,7 +1790,7 @@ def render_feature_engineering():
                 )
                 st.session_state.feature_engineering_outputs = {"featured_dataset": featured}
                 st.session_state.featured_preview = featured
-                st.success(f"\u2705 Features created: {len(featured.columns) - 2} features, {len(featured)} rows")
+                st.success(f"\u2705 Sensor-derived features prepared: {len(featured.columns) - 2} features, {len(featured)} rows")
             except Exception as e:
                 st.error(f"\u274c {e}")
 
@@ -1585,17 +1840,26 @@ def render_normalization():
             try:
                 norm_cols = [c for c in featured.columns if c not in [ts_col, target_col]]
                 if method == "none":
-                    normalized = featured.copy()
+                    normalized_base = featured.copy()
                     summary = get_normalization_summary(featured, featured, norm_cols)
                 else:
                     before = featured.copy()
-                    normalized = normalize_dataset(featured.copy(), norm_cols, method)
-                    summary = get_normalization_summary(before, normalized, norm_cols)
+                    normalized_base = normalize_dataset(featured.copy(), norm_cols, method)
+                    summary = get_normalization_summary(before, normalized_base, norm_cols)
+
+                from modules.feature_engineering import append_time_features
+                normalized = append_time_features(
+                    dataframe=normalized_base,
+                    timestamp_column=ts_col,
+                    config=config.get("feature_engineering", {}),
+                )
+                added_time_cols = [c for c in normalized.columns if c not in normalized_base.columns]
 
                 st.session_state.normalization_outputs = {
                     "normalized_dataset": normalized,
                     "method": method,
                     "summary": summary,
+                    "added_time_columns": added_time_cols,
                 }
                 st.success(f"\u2705 Normalization applied: {method_label}")
             except Exception as e:
@@ -1610,12 +1874,20 @@ def render_normalization():
             before_tbl, after_tbl = _normalization_summary_tables(summary)
             t1, t2 = st.tabs(["Before", "After"])
             with t1:
+                st.markdown("#### Before normalization summary")
+                st.caption("Summary of feature columns before scaling. Timestamp and reference target are excluded.")
                 st.dataframe(before_tbl, width='stretch')
                 render_df_download(before_tbl, key="norm_before_csv", filename="normalization_before.csv")
             with t2:
+                st.markdown("#### After normalization summary")
+                st.caption("Summary of the same feature columns after the selected normalization method.")
                 st.dataframe(after_tbl, width='stretch')
                 render_df_download(after_tbl, key="norm_after_csv", filename="normalization_after.csv")
 
+        added_time_cols = norm_out.get("added_time_columns", [])
+        if added_time_cols:
+            st.caption(f"Time features added after normalization: {', '.join(added_time_cols)}")
+        st.markdown("#### Normalized dataset preview")
         st.dataframe(normalized.head(20), width='stretch')
         render_df_download(normalized, key="norm_dataset_csv", filename="normalized_dataset.csv")
 
@@ -1869,13 +2141,14 @@ def render_modelling():
             ),
         )
         cv_folds = c2.number_input(
-            "CV folds",
+            "Number of validation folds",
             2, 10,
             int(config["training"].get("cross_validation_folds", 5)),
+            disabled=(str(config["training"].get("validation_method", "timeseriessplit")).strip().lower() == "holdout"),
             help=(
-                "Number of cross-validation splits used during training to estimate generalisation. "
+                "Controls how many validation splits are used for TimeSeriesSplit or K-Fold. "
                 "Uses **TimeSeriesSplit** — folds respect chronological order so future data is "
-                "never used to train on past. 5 folds is a good default; reduce to 3 for very small datasets."
+                "This is not a feature-selection setting. Holdout uses one chronological test split."
             ),
         )
         validation_labels = {
@@ -2070,13 +2343,21 @@ def render_modelling():
                 st.session_state.modeling_outputs = outputs
                 st.session_state.selected_model_name = outputs["best_model_name"]
                 _reset_downstream(*_DOWNSTREAM_FROM_MODELING)
+                _record_run_history("Manual training")
                 st.success("✅ All models trained successfully!")
             except Exception as e:
                 st.error(f"❌ {e}")
 
     out = st.session_state.modeling_outputs
     if out is not None:
-        st.markdown("### 🏅 Leaderboard")
+        st.markdown("### Validation Leaderboard")
+        st.caption("Ranking is based on validation predictions, not the final full-data fitted predictions.")
+        with st.expander("How metrics are calculated", expanded=False):
+            st.markdown(
+                "RMSE, MAE, R2, MAPE, Bias, Pearson r, Slope, and Intercept are calculated from "
+                "the selected validation method. TimeSeriesSplit and K-Fold use out-of-fold "
+                "validation predictions; Holdout uses the final chronological test split."
+            )
         st.dataframe(
             _format_metric_dataframe(out["leaderboard"])
             .style.highlight_min(subset=["rmse", "mae"], color="#065f4630")
@@ -2090,128 +2371,6 @@ def render_modelling():
                 for mname, res in tuned.items():
                     st.markdown(f"**{mname}**")
                     st.json(res.best_params)
-
-        # ---- Multi-Model Comparison ----
-        st.markdown("---")
-        with st.expander("🔀 Compare Models Side-by-Side", expanded=False):
-            st.caption(
-                "Select any number of trained models to compare. "
-                "All views update instantly when you change the selection. "
-                "Use this to decide which model to carry forward into Results and Post-Analysis."
-            )
-            _all_model_names = list(out["training_results"].keys())
-            _selected_compare = st.multiselect(
-                "Models to compare",
-                options=_all_model_names,
-                default=_all_model_names,
-                key="compare_models_multi",
-                help=(
-                    "Select 2 or more models to compare. All trained models are selected by default. "
-                    "Remove models you are not interested in to keep the view clean."
-                ),
-            )
-
-            if len(_selected_compare) < 2:
-                st.warning("⚠️ Select at least 2 models to enable comparison.")
-            else:
-                _sel_results = {m: out["training_results"][m] for m in _selected_compare}
-                _ctabs = st.tabs(["📊 Scatter Grid", "📈 Time-Series Overlay", "📋 Metrics Table"])
-
-                # ---- Tab 1: Scatter grid (max 2 per row) ----
-                with _ctabs[0]:
-                    st.caption(
-                        "Each panel shows predicted vs actual for that model, "
-                        "with a 1:1 ideal line (gold) and an OLS fit line (green)."
-                    )
-                    _n = len(_selected_compare)
-                    _ncols = min(2, _n)
-                    _rows = [_selected_compare[i:i + _ncols] for i in range(0, _n, _ncols)]
-                    for _row_models in _rows:
-                        _cols = st.columns(len(_row_models))
-                        for _col, _mname in zip(_cols, _row_models):
-                            with _col:
-                                st.markdown(f"**{_mname}**")
-                                _display_chart_with_downloads(
-                                    create_scatter_with_fit(
-                                        _sel_results[_mname].full_predictions,
-                                        model_name=_mname,
-                                    ),
-                                    _sel_results[_mname].full_predictions,
-                                    key=f"cmp_scatter_{_mname}",
-                                    filename_prefix=f"compare_scatter_{_mname}",
-                                )
-
-                # ---- Tab 2: Time-series overlay ----
-                with _ctabs[1]:
-                    st.caption(
-                        "All selected model predictions overlaid on a single time-series chart. "
-                        "Reference (actual) values are shown in white."
-                    )
-                    _display_chart_with_downloads(
-                        create_multi_model_timeseries(_sel_results), None,
-                        key="cmp_ts", filename_prefix="compare_timeseries",
-                    )
-
-                # ---- Tab 3: Metrics table ----
-                with _ctabs[2]:
-                    _metric_keys = ["rmse", "mae", "r2", "mape", "bias", "pearson_r", "slope", "intercept"]
-                    _metric_labels = {
-                        "rmse": "RMSE ↓",
-                        "mae": "MAE ↓",
-                        "r2": "R² ↑",
-                        "mape": "MAPE ↓",
-                        "bias": "Bias → 0",
-                        "pearson_r": "Pearson r ↑",
-                        "slope": "Slope → 1.0",
-                        "intercept": "Intercept → 0",
-                    }
-                    _cmp_data = {}
-                    for _mk in _metric_keys:
-                        _cmp_data[_metric_labels[_mk]] = {
-                            m: round(float(_sel_results[m].metrics.get(_mk, float("nan"))), 2)
-                            for m in _selected_compare
-                        }
-                    _cmp_df = pd.DataFrame(_cmp_data).T
-                    _cmp_df.index.name = "Metric"
-
-                    # Highlight best value per metric
-                    def _highlight_best(row: pd.Series) -> list:
-                        label = row.name
-                        try:
-                            if "↓" in label or "→ 0" in label:
-                                best_idx = row.abs().idxmin() if "→ 0" in label else row.idxmin()
-                            else:
-                                best_idx = row.idxmax()
-                            return [
-                                "background-color: #065f4660; font-weight: bold;" if c == best_idx else ""
-                                for c in row.index
-                            ]
-                        except Exception:
-                            return [""] * len(row)
-
-                    st.dataframe(
-                        _cmp_df.style.apply(_highlight_best, axis=1),
-                        width='stretch',
-                    )
-                    render_df_download(
-                        _cmp_df.reset_index(), key="cmp_metrics_csv",
-                        filename="model_comparison_metrics.csv",
-                    )
-                    st.caption(
-                        "**↓** = lower is better  ·  **↑** = higher is better  ·  **→ 0 / → 1** = closer to target is better. "
-                        "Best value in each row is highlighted in green."
-                    )
-
-                    # Also show a bar chart of key metrics
-                    st.markdown("---")
-                    st.markdown("**Visual metric comparison:**")
-                    _lb_filtered = out["leaderboard"][out["leaderboard"]["model_name"].isin(_selected_compare)]
-                    _display_chart_with_downloads(
-                        create_multi_model_metrics_bar(_lb_filtered),
-                        _format_metric_dataframe(_lb_filtered),
-                        key="cmp_metrics_bar", filename_prefix="compare_metrics_bar",
-                    )
-
 
     st.markdown("---")
     if st.button("Next ➡️", key="next_modeling_always", width='stretch', disabled=(out is None),
@@ -2240,16 +2399,37 @@ def render_results():
     )
     st.session_state.selected_model_name = sel_name
     result = out["training_results"][sel_name]
+    prediction_scope_label = st.radio(
+        "Prediction data for charts",
+        ["Validation predictions", "Full fitted predictions"],
+        horizontal=True,
+        key="results_prediction_scope",
+        help=(
+            "Validation predictions match the leaderboard metrics. Full fitted predictions "
+            "come from the final model refit on all available modelling rows."
+        ),
+    )
+    prediction_scope = "validation" if prediction_scope_label == "Validation predictions" else "full"
+    st.caption(_prediction_scope_caption(prediction_scope))
+
+    with st.expander("Saved run history", expanded=False):
+        _render_run_history("results_run_history")
 
     tabs = st.tabs(["📏 Metrics", "🔍 Explainability", "📊 Scatter", "🔀 Multi-Model"])
 
     with tabs[0]:
-        st.markdown("#### Performance Metrics")
+        st.markdown("#### Validation Metrics")
+        with st.expander("How metrics are calculated", expanded=False):
+            st.markdown(
+                "The leaderboard and metric cards use validation predictions. TimeSeriesSplit and K-Fold "
+                "use out-of-fold predictions; Holdout uses the chronological test split. Full fitted "
+                "predictions are available for visual inspection, but they are not used for ranking."
+            )
         render_metric_row(result.metrics, ["rmse", "mae", "r2", "mape"], ["RMSE", "MAE", "R²", "MAPE"])
         st.markdown("")
         render_metric_row(result.metrics, ["bias", "pearson_r", "slope", "intercept"],
                           ["Bias", "Pearson r", "Slope", "Intercept"])
-        st.markdown("#### Full Leaderboard")
+        st.markdown("#### Validation Leaderboard")
         leaderboard_fmt = _format_metric_dataframe(out["leaderboard"])
         st.dataframe(leaderboard_fmt, width='stretch')
         render_df_download(leaderboard_fmt, key="leaderboard_csv", filename="leaderboard.csv")
@@ -2292,31 +2472,70 @@ def render_results():
 
     with tabs[2]:
         st.markdown("#### Scatter Plot — Predicted vs Actual (with 1:1 & OLS Fit)")
-        fig_scatter = create_scatter_with_fit(result.full_predictions, model_name=sel_name)
+        scatter_predictions = _prediction_frame(result, prediction_scope)
+        fig_scatter = create_scatter_with_fit(scatter_predictions, model_name=sel_name)
         title, x_label, y_label = _chart_customization(
             "res_scatter", f"Predicted vs Actual — {sel_name}", "Actual", "Predicted"
         )
         fig_scatter.update_layout(title=title, xaxis_title=x_label, yaxis_title=y_label)
         _display_chart_with_downloads(
-            fig_scatter, result.full_predictions, key="res_scatter", filename_prefix="predicted_vs_actual"
+            fig_scatter, scatter_predictions, key="res_scatter", filename_prefix="predicted_vs_actual"
         )
 
     with tabs[3]:
         st.markdown("#### Multi-Model Comparison")
+        compare_models = st.multiselect(
+            "Models to compare",
+            model_names,
+            default=model_names,
+            key="results_compare_models",
+            help="Choose the trained models to include in the comparison plots.",
+        )
+        if not compare_models:
+            st.warning("Select at least one model to compare.")
+            return
+        selected_results = {name: out["training_results"][name] for name in compare_models}
         comp_tabs = st.tabs(["📊 Scatter Grid", "📈 Time-Series Overlay", "📋 Metrics Bar"])
         with comp_tabs[0]:
             _display_chart_with_downloads(
-                create_multi_model_scatter(out["training_results"]), None,
+                create_multi_model_scatter(selected_results, prediction_scope=prediction_scope), None,
                 key="res_multi_scatter", filename_prefix="multi_model_scatter",
             )
         with comp_tabs[1]:
+            st.caption(_prediction_scope_caption(prediction_scope))
+            ts_frames = [
+                _prediction_frame(model_result, prediction_scope)[["timestamp", "actual", "predicted"]].assign(model=model_name)
+                for model_name, model_result in selected_results.items()
+            ]
+            ts_source = pd.concat(ts_frames, ignore_index=True) if ts_frames else pd.DataFrame()
+            if not ts_source.empty:
+                ts_source["timestamp"] = pd.to_datetime(ts_source["timestamp"])
+                min_ts = ts_source["timestamp"].min()
+                max_ts = ts_source["timestamp"].max()
+                d1, d2 = st.columns(2)
+                start_date = d1.date_input("Start date", value=min_ts.date(), key="res_multi_ts_start")
+                end_date = d2.date_input("End date", value=max_ts.date(), key="res_multi_ts_end")
+                start_ts = pd.Timestamp(start_date)
+                end_ts = pd.Timestamp(end_date) + pd.Timedelta(days=1)
+                ts_source = ts_source[(ts_source["timestamp"] >= start_ts) & (ts_source["timestamp"] < end_ts)]
+            else:
+                start_ts = end_ts = None
+            fig_multi_ts = create_multi_model_timeseries(selected_results, prediction_scope=prediction_scope)
+            if start_ts is not None and end_ts is not None:
+                fig_multi_ts.update_xaxes(range=[start_ts, end_ts])
+            title, x_label, y_label = _chart_customization(
+                "res_multi_ts", "Multi-Model Time-Series Overlay", "Time", "Concentration"
+            )
+            fig_multi_ts.update_layout(title=title, xaxis_title=x_label, yaxis_title=y_label)
             _display_chart_with_downloads(
-                create_multi_model_timeseries(out["training_results"]), None,
+                fig_multi_ts, ts_source if not ts_source.empty else None,
                 key="res_multi_ts", filename_prefix="multi_model_timeseries",
             )
         with comp_tabs[2]:
+            metrics_bar_df = out["leaderboard"][out["leaderboard"]["model_name"].isin(compare_models)]
+            st.caption("Metric bars use validation metrics from the leaderboard.")
             _display_chart_with_downloads(
-                create_multi_model_metrics_bar(out["leaderboard"]), _format_metric_dataframe(out["leaderboard"]),
+                create_multi_model_metrics_bar(metrics_bar_df), _format_metric_dataframe(metrics_bar_df),
                 key="res_multi_bar", filename_prefix="multi_model_metrics",
             )
 
@@ -2356,9 +2575,24 @@ def render_statistical_diagnostics():
     result = out["training_results"][selected]
     model_df = out["featured_data"]
     feature_names = [column for column in result.feature_names if column in model_df.columns]
+    original_predictors = [
+        column for column in (st.session_state.selected_predictors or [])
+        if column in model_df.columns and column in feature_names
+    ]
+    vif_scope = st.radio(
+        "VIF predictor set",
+        ["Original predictors", "All trained features"],
+        horizontal=True,
+        key="vif_scope",
+        help=(
+            "Original predictors are easier to interpret. All trained features includes lag, "
+            "rolling, polynomial, interaction, and time-derived columns when used."
+        ),
+    )
+    vif_features = original_predictors if vif_scope == "Original predictors" and original_predictors else feature_names
 
     coefficient_table = _format_coefficient_table(result.coefficient_table)
-    vif_table = compute_vif(model_df[feature_names]) if feature_names else pd.DataFrame(columns=["Variable", "VIF"])
+    vif_table = compute_vif(model_df[vif_features]) if vif_features else pd.DataFrame(columns=["Variable", "VIF"])
     shapiro_result = shapiro_wilk_test(result.residuals if result.residuals is not None else pd.Series(dtype=float))
     st.session_state.diagnostics_outputs = {
         "model_name": selected,
@@ -2376,6 +2610,12 @@ def render_statistical_diagnostics():
             filename=f"{selected}_coefficient_table.csv",
         )
     with tab2:
+        rows_used = vif_table.attrs.get("rows_used")
+        st.caption(f"VIF predictor set: {vif_scope} ({len(vif_features)} column(s)).")
+        if rows_used is not None:
+            st.caption(f"VIF computed using {rows_used} complete rows after removing missing/inf values.")
+        if "Status" in vif_table.columns and (vif_table["Status"] != "ok").any():
+            st.warning("Some VIF values need attention. Check the Status column for constants or unstable multicollinearity.")
         st.dataframe(vif_table, width='stretch')
         render_df_download(
             vif_table,
@@ -2403,21 +2643,8 @@ def render_residual_analysis():
 
     sel_name = st.session_state.selected_model_name or out["best_model_name"]
     result = out["training_results"][sel_name]
-    predictions_df = result.full_predictions
-
-    # Plot style options
-    PLOT_STYLES = {"Scatter": "markers", "Connected Line": "lines", "Dotted Line": "lines"}
-    PLOT_DASHES = {"Scatter": None, "Connected Line": None, "Dotted Line": "dot"}
-
-    def _apply_plot_style(fig, style_name):
-        """Apply the selected plot style to the first data trace."""
-        mode = PLOT_STYLES.get(style_name, "markers")
-        dash = PLOT_DASHES.get(style_name)
-        if fig.data:
-            fig.data[0].mode = mode
-            if dash:
-                fig.data[0].line = dict(dash=dash)
-        return fig
+    predictions_df = _prediction_frame(result, "validation")
+    st.caption("Residual diagnostics use validation predictions, matching the leaderboard metrics.")
 
     tabs = st.tabs([
         "📊 Predicted vs Actual",
@@ -2431,10 +2658,8 @@ def render_residual_analysis():
         title_1, x_1, y_1 = _chart_customization(
             "ra_pva", "Predicted vs Actual", "Actual (Reference)", "Predicted (Calibrated)",
         )
-        style_1 = st.selectbox("Plot style", list(PLOT_STYLES.keys()), key="ra_pva_style")
         fig_pva = create_predicted_vs_actual_figure(predictions_df)
         fig_pva.update_layout(title=title_1, xaxis_title=x_1, yaxis_title=y_1)
-        _apply_plot_style(fig_pva, style_1)
         source_pva = predictions_df[["actual", "predicted"]].copy()
         _display_chart_with_downloads(fig_pva, source_pva, key="ra_pva", filename_prefix="predicted_vs_actual")
 
@@ -2443,10 +2668,8 @@ def render_residual_analysis():
         title_2, x_2, y_2 = _chart_customization(
             "ra_rvf", "Residual vs Fitted", "Predicted Value", "Residual (Predicted − Actual)",
         )
-        style_2 = st.selectbox("Plot style", list(PLOT_STYLES.keys()), key="ra_rvf_style")
         fig_rvf = create_residual_vs_predicted_figure(predictions_df)
         fig_rvf.update_layout(title=title_2, xaxis_title=x_2, yaxis_title=y_2)
-        _apply_plot_style(fig_rvf, style_2)
         source_rvf = pd.DataFrame({
             "predicted": predictions_df["predicted"],
             "residual": predictions_df["predicted"] - predictions_df["actual"],
@@ -2471,10 +2694,8 @@ def render_residual_analysis():
             "ra_qq", "QQ Plot — Residuals vs Normal Distribution",
             "Theoretical Quantiles", "Sample Quantiles",
         )
-        style_4 = st.selectbox("Plot style", list(PLOT_STYLES.keys()), key="ra_qq_style")
         fig_qq = create_qq_plot(predictions_df)
         fig_qq.update_layout(title=title_4, xaxis_title=x_4, yaxis_title=y_4)
-        _apply_plot_style(fig_qq, style_4)
         residuals_arr = np.asarray(predictions_df["predicted"] - predictions_df["actual"], dtype=float)
         source_qq = pd.DataFrame({"residual": residuals_arr})
         _display_chart_with_downloads(fig_qq, source_qq, key="ra_qq", filename_prefix="qq_plot")
@@ -2490,7 +2711,7 @@ def render_residual_analysis():
 # ---------------------------------------------------------------------------
 
 def render_export():
-    st.subheader("💾 Export — Zenodo-Ready Outputs")
+    st.subheader("💾 Export Outputs")
     out = st.session_state.modeling_outputs
     if out is None or st.session_state.config is None:
         st.info("Complete the **Modelling** step first.")
@@ -2502,19 +2723,34 @@ def render_export():
     ts_col = config["data"]["timestamp_column"]
     target_col = st.session_state.selected_target or f"{config['data']['reference_prefix']}_{config['data']['target_column']}"
 
+    predictions = predict_with_model(result.model, out["featured_data"], target_col, ts_col)
     calibrated = (
         out["featured_data"][[ts_col, target_col]]
-        .merge(
-            predict_with_model(result.model, out["featured_data"], target_col, ts_col),
-            on=ts_col, how="left",
-        )
+        .merge(predictions, on=ts_col, how="left")
         .rename(columns={target_col: "reference_value", "prediction": "calibrated_value"})
+    )
+    full_calibrated = (
+        out["featured_data"]
+        .merge(predictions[[ts_col, "prediction"]], on=ts_col, how="left")
+        .rename(columns={"prediction": "calibrated_value"})
+    )
+    if target_col in full_calibrated.columns and "reference_value" not in full_calibrated.columns:
+        full_calibrated["reference_value"] = full_calibrated[target_col]
+    full_calibrated["prediction_error"] = (
+        full_calibrated["calibrated_value"] - full_calibrated["reference_value"]
     )
 
     st.markdown(info_pill(f"Model: {sel_name}") + info_pill(f"Features: {len(result.feature_names)}"),
                 unsafe_allow_html=True)
-    st.dataframe(calibrated.head(20), width='stretch')
-    render_df_download(calibrated, key="calibrated_csv", filename="calibrated_dataset.csv")
+    export_tabs = st.tabs(["Compact calibrated output", "Full calibrated output"])
+    with export_tabs[0]:
+        st.caption("Timestamp, reference value, and calibrated prediction.")
+        st.dataframe(calibrated.head(20), width='stretch')
+        render_df_download(calibrated, key="calibrated_csv", filename="calibrated_dataset.csv")
+    with export_tabs[1]:
+        st.caption("All modelling columns plus calibrated prediction, reference value, and prediction error.")
+        st.dataframe(full_calibrated.head(20), width='stretch')
+        render_df_download(full_calibrated, key="full_calibrated_csv", filename="full_calibrated_dataset.csv")
 
     if st.button("🚀 Prepare Export Bundle", key="run_export", width='stretch'):
         with st.spinner("Packaging artefacts…"):
@@ -2526,10 +2762,14 @@ def render_export():
                     metrics=result.metrics,
                     feature_names=result.feature_names,
                     config=config,
+                    full_calibrated_dataset=full_calibrated,
                     coefficient_table=getattr(result, "coefficient_table", None),
                     selected_target=st.session_state.selected_target,
                     selected_predictors=st.session_state.selected_predictors,
                     modelling_objective=config.get("modelling", {}).get("objective"),
+                    leaderboard=out["leaderboard"],
+                    training_results=out["training_results"],
+                    prepared_dataset=out["featured_data"],
                 )
                 st.session_state.export_bundle = bundle
                 st.success("✅ Export bundle ready!")
@@ -2538,27 +2778,45 @@ def render_export():
 
     bundle = st.session_state.export_bundle
     if bundle is not None:
-        st.markdown("### 📦 Download Artefacts")
+        st.markdown("### Download Files")
         c1, c2, c3 = st.columns(3)
-        c1.download_button("📄 Calibrated Dataset (CSV)", bundle["calibrated_dataset_csv"],
+        c1.download_button("Compact calibrated CSV", bundle["calibrated_dataset_csv"],
                            file_name="calibrated_dataset.csv", mime="text/csv", width='stretch')
-        c2.download_button("🤖 Trained Model (.pkl)", bundle["model_pickle"],
+        c2.download_button("Full calibrated CSV", bundle.get("full_calibrated_dataset_csv", b""),
+                           file_name="full_calibrated_dataset.csv", mime="text/csv", width='stretch',
+                           disabled=("full_calibrated_dataset_csv" not in bundle))
+        c3.download_button("Trained model (.pkl)", bundle["model_pickle"],
                            file_name=f"{sel_name}.pkl", mime="application/octet-stream", width='stretch')
-        c3.download_button("📊 Metrics (JSON)", bundle["metrics_json"],
-                           file_name="metrics.json", mime="application/json", width='stretch')
         c4, c5, c6 = st.columns(3)
-        c4.download_button("⚙️ Config (JSON)", bundle["config_json"],
+        c4.download_button("Metrics JSON", bundle["metrics_json"],
+                           file_name="metrics.json", mime="application/json", width='stretch')
+        c5.download_button("All model metrics JSON", bundle["all_model_metrics_json"],
+                           file_name="all_model_metrics.json", mime="application/json", width='stretch',
+                           key="download_all_model_metrics_json")
+        c6.download_button("Config JSON", bundle["config_json"],
                            file_name="config.json", mime="application/json", width='stretch')
-        c5.download_button("⚙️ Config (YAML)", bundle["config_yaml"],
-                           file_name="config.yaml", mime="text/yaml", width='stretch')
-        c6.download_button("📋 Metadata (JSON)", bundle["metadata_json"],
-                           file_name="metadata.json", mime="application/json", width='stretch')
         c7, c8, c9 = st.columns(3)
-        c7.download_button("📄 project_run.json", bundle["project_run_json"],
-                           file_name="project_run.json", mime="application/json", width='stretch')
+        c7.download_button("Config YAML", bundle["config_yaml"],
+                           file_name="config.yaml", mime="text/yaml", width='stretch')
+        if "research_report_pdf" in bundle:
+            c8.download_button("Research report PDF", bundle["research_report_pdf"],
+                               file_name="CaliSenseAQ_research_report.pdf", mime="application/pdf", width='stretch',
+                               key="download_research_report_pdf")
         if "model_summary_pdf" in bundle:
-            c8.download_button("📑 PDF Model Report", bundle["model_summary_pdf"],
-                               file_name=f"{sel_name}_report.pdf", mime="application/pdf", width='stretch')
+            c9.download_button("Selected model PDF", bundle["model_summary_pdf"],
+                               file_name=f"{sel_name}_report.pdf", mime="application/pdf", width='stretch',
+                               key="download_selected_model_pdf")
+        with st.expander("Zenodo/demo archival files", expanded=False):
+            st.caption("Optional provenance files for demo archiving or repository upload.")
+            z1, z2, z3 = st.columns(3)
+            z1.download_button("Metadata JSON", bundle["metadata_json"],
+                               file_name="metadata.json", mime="application/json", width='stretch')
+            z2.download_button("project_run.json", bundle["project_run_json"],
+                               file_name="project_run.json", mime="application/json", width='stretch')
+            if "research_report_pdf" in bundle:
+                z3.download_button("Research report PDF", bundle["research_report_pdf"],
+                                   file_name="CaliSenseAQ_research_report.pdf", mime="application/pdf", width='stretch',
+                                   key="download_zenodo_research_report_pdf")
 
 
 # ---------------------------------------------------------------------------
@@ -2566,7 +2824,7 @@ def render_export():
 # ---------------------------------------------------------------------------
 
 _DEFAULT_README = """\
-# Air Quality Sensor Calibration Lab — User Guide
+# CaliSenseAQ - User Guide
 **Version 5.0** | Research-grade ML pipeline for calibrating low-cost air quality sensors
 
 ---
@@ -2618,7 +2876,7 @@ and gives it to the model as a new input. This lets the model learn from recent 
 |---------|-------------|
 | Lag features | Shifted copies of sensor columns (configurable steps) |
 | Rolling mean/std | Moving average ± volatility windows |
-| Polynomial (deg 2/3) | Squared/cubed terms + cross-products for chosen columns |
+| Polynomial (deg 2/3) | Squared/cubed terms for chosen columns |
 | Interaction terms | Pairwise products (col_i × col_j) — useful for PM × RH hygroscopic correction |
 | Hour/DOW/DOM | Basic time of day / day of week / day of month |
 | Cyclical encodings | sin/cos of hour, DOW, DOY — avoids ordinal discontinuity in linear models |
@@ -2710,23 +2968,25 @@ def render_readme():
 
 def main():
     st.set_page_config(
-        page_title="Air Quality Calibration Lab",
+        page_title="CaliSenseAQ",
         page_icon="🌬️",
         layout="wide",
         initial_sidebar_state="expanded",
     )
     init_state()
+    _render_mode_toggle()
     _render_theme_toggle()
     inject_css()
     render_header()
 
     st.session_state.current_step = step_nav()
-    current_idx = STEPS.index(st.session_state.current_step)
+    current_steps = visible_steps(STEPS, STEP_KEYS, st.session_state.get("app_mode", "Basic"))
+    current_idx = current_steps.index(st.session_state.current_step)
     render_step_progress(current_idx)
 
     # Sidebar info
     st.sidebar.markdown("---")
-    st.sidebar.caption("v5.0 · Calibration Lab")
+    st.sidebar.caption("v5.0 - CaliSenseAQ")
     if st.session_state.config:
         st.sidebar.caption(f"Target: {st.session_state.config['data']['target_column']}")
     if st.session_state.selected_model_name:
@@ -2752,4 +3012,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -30,12 +30,35 @@ def compute_vif(X: pd.DataFrame) -> pd.DataFrame:
         .replace([np.inf, -np.inf], np.nan)
         .dropna(axis=0)
     )
+    constant_columns = [
+        column for column in numeric_X.columns
+        if numeric_X[column].nunique(dropna=True) <= 1
+    ]
+    numeric_X = numeric_X.drop(columns=constant_columns, errors="ignore")
     columns = numeric_X.columns.tolist()
 
     if not columns:
-        return pd.DataFrame(columns=["Variable", "VIF"])
+        rows = [
+            {"Variable": str(column), "VIF": float("nan"), "Status": "constant column excluded"}
+            for column in constant_columns
+        ]
+        result = pd.DataFrame(rows, columns=["Variable", "VIF", "Status"])
+        result.attrs["rows_used"] = int(len(numeric_X))
+        result.attrs["constant_columns"] = [str(column) for column in constant_columns]
+        return result
     if len(columns) == 1 or numeric_X.empty:
-        return pd.DataFrame({"Variable": columns, "VIF": [1.0] * len(columns)})
+        rows = [
+            {"Variable": str(column), "VIF": 1.0, "Status": "single predictor"}
+            for column in columns
+        ]
+        rows.extend(
+            {"Variable": str(column), "VIF": float("nan"), "Status": "constant column excluded"}
+            for column in constant_columns
+        )
+        result = pd.DataFrame(rows)
+        result.attrs["rows_used"] = int(len(numeric_X))
+        result.attrs["constant_columns"] = [str(column) for column in constant_columns]
+        return result
 
     X_with_const = sm.add_constant(numeric_X, has_constant="add")
     rows: list[dict[str, float | str]] = []
@@ -45,11 +68,20 @@ def compute_vif(X: pd.DataFrame) -> pd.DataFrame:
         try:
             vif_value = variance_inflation_factor(X_with_const.to_numpy(dtype=float), index)
             vif = round(float(vif_value), 4)
+            status = "ok" if np.isfinite(vif) else "infinite or unstable"
         except Exception:
             vif = float("nan")
-        rows.append({"Variable": str(column), "VIF": vif})
+            status = "could not compute"
+        rows.append({"Variable": str(column), "VIF": vif, "Status": status})
 
-    return pd.DataFrame(rows).sort_values("VIF", ascending=False).reset_index(drop=True)
+    rows.extend(
+        {"Variable": str(column), "VIF": float("nan"), "Status": "constant column excluded"}
+        for column in constant_columns
+    )
+    result = pd.DataFrame(rows).sort_values("VIF", ascending=False).reset_index(drop=True)
+    result.attrs["rows_used"] = int(len(numeric_X))
+    result.attrs["constant_columns"] = [str(column) for column in constant_columns]
+    return result
 
 
 def _result_names(ols_result: Any, feature_names: Optional[Iterable[str]] = None) -> list[str]:

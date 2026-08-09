@@ -1,6 +1,6 @@
-# Air Quality Sensor Calibration Lab v4.0
+# CaliSenseAQ
 
-Research-grade Python application for calibrating low-cost air quality sensor (LCS)
+Python application for calibrating low-cost air quality sensor (LCS)
 measurements against reference-grade data using a scientifically robust, reproducible
 machine learning pipeline.
 
@@ -24,7 +24,7 @@ The application supports:
 - Bland-Altman agreement plot (optional toggle)
 - Post-calibration analysis with drift detection and rolling error analysis
 - In-app editable README/notes tab (Markdown + live preview + download)
-- Zenodo-ready export: calibrated CSV, model .pkl, metrics JSON, config YAML, metadata JSON
+- Export outputs: compact/full calibrated CSVs, model .pkl, selected/all-model metrics JSON, config YAML, researcher PDF report, and optional Zenodo/demo metadata JSON
 - **Inline tooltips & captions** on every widget across all pipeline steps
 - **📚 Model Reference Guide** — one tab per model with formula, algorithm description, and hyperparameter table
 - Full user control over every pipeline parameter
@@ -85,6 +85,12 @@ pip install -r requirements.txt
 streamlit run ui/app.py
 ```
 
+## Smoke Test
+
+```bash
+python tests/smoke_test.py
+```
+
 ## Workflow (8 Steps)
 
 1. **Upload Data** — Upload CSVs or use bundled samples; configure timestamp/target columns
@@ -94,7 +100,7 @@ streamlit run ui/app.py
 5. **Modelling** — Configure features (lag, rolling, time, polynomial, interactions), select models, tune hyperparameters, preview feature set, train all models
 6. **Results** — View leaderboard, select model, inspect metrics and explainability charts; compare multiple models side-by-side
 7. **Post-Analysis** — Predicted vs actual, residuals, time-series overlay, rolling error drift detection, Bland-Altman agreement plot
-8. **Export** — Download calibrated CSV, model .pkl, metrics JSON, config YAML/JSON, metadata JSON
+8. **Export** — Download calibrated CSV, model .pkl, metrics JSON, all-model metrics JSON, researcher PDF report, config YAML/JSON, metadata JSON
 
 ## Calibration Metrics
 

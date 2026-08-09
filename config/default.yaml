@@ -31,9 +31,9 @@ alignment:
 feature_engineering:
   enabled: true
   lag_steps: []
-  rolling_windows: [3, 6]
-  rolling_std: true
-  add_time_features: true
+  rolling_windows: []
+  rolling_std: false
+  add_time_features: false
   optional_columns:
     - sensor_temperature
     - sensor_humidity

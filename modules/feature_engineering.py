@@ -82,10 +82,10 @@ def create_polynomial_features(
     columns: List[str],
     degree: int = 2,
 ) -> pd.DataFrame:
-    """Add polynomial terms (degree 2 or 3) for a user-selected subset of columns.
+    """Add squared/cubic terms for a user-selected subset of columns.
 
-    Uses sklearn PolynomialFeatures internally, but only appends the *new*
-    columns (powers and cross-products) — the originals are kept as-is.
+    Pairwise cross-products are handled by ``create_interaction_terms`` so the
+    UI can explain polynomial and interaction features separately.
 
     Parameters
     ----------
@@ -104,20 +104,14 @@ def create_polynomial_features(
     if not columns or degree <= 1:
         return dataframe.copy()
 
-    from sklearn.preprocessing import PolynomialFeatures
-
     valid_cols = [c for c in columns if c in dataframe.columns]
     if not valid_cols:
         return dataframe.copy()
 
     engineered = dataframe.copy()
-    poly = PolynomialFeatures(degree=degree, include_bias=False, interaction_only=False)
-    transformed = poly.fit_transform(engineered[valid_cols])
-    feat_names = poly.get_feature_names_out(valid_cols)
-
-    for name, values in zip(feat_names, transformed.T):
-        if name not in engineered.columns:   # skip duplicates of originals
-            engineered[name] = values
+    for column in valid_cols:
+        for power in range(2, degree + 1):
+            engineered[f"{column}_pow_{power}"] = engineered[column] ** power
 
     return engineered
 
@@ -289,6 +283,27 @@ def engineer_features(
     pd.DataFrame
         Feature-engineered dataset ready for modelling.
     """
+    engineered = engineer_sensor_features(
+        dataframe=dataframe,
+        timestamp_column=timestamp_column,
+        target_column=target_column,
+        config=config,
+    )
+    engineered = append_time_features(
+        dataframe=engineered,
+        timestamp_column=timestamp_column,
+        config=config,
+    )
+    return engineered.dropna().reset_index(drop=True)
+
+
+def engineer_sensor_features(
+    dataframe: pd.DataFrame,
+    timestamp_column: str,
+    target_column: str,
+    config: Dict[str, object],
+) -> pd.DataFrame:
+    """Apply sensor-derived features, excluding timestamp-derived features."""
     if not bool(config.get("enabled", True)):
         return dataframe.copy()
 
@@ -301,29 +316,35 @@ def engineer_features(
     engineered = create_lag_features(
         dataframe=dataframe,
         feature_columns=feature_columns,
-        lag_steps=[int(s) for s in config.get("lag_steps", [1, 2, 3])],
+        lag_steps=[int(s) for s in config.get("lag_steps", [])],
     )
     engineered = create_rolling_features(
         dataframe=engineered,
         feature_columns=feature_columns,
-        windows=[int(w) for w in config.get("rolling_windows", [3, 6])],
-        include_std=bool(config.get("rolling_std", True)),
+        windows=[int(w) for w in config.get("rolling_windows", [])],
+        include_std=bool(config.get("rolling_std", False)),
     )
 
-    # Polynomial features (user-chosen subset)
     poly_cols = [str(c) for c in config.get("polynomial_columns", [])]
     poly_degree = int(config.get("polynomial_degree", 1))
     if poly_cols and poly_degree > 1:
         engineered = create_polynomial_features(engineered, poly_cols, poly_degree)
 
-    # Interaction terms (user-chosen subset)
     interaction_cols = [str(c) for c in config.get("interaction_columns", [])]
     if interaction_cols:
         engineered = create_interaction_terms(engineered, interaction_cols)
 
-    # Time features
-    if bool(config.get("add_time_features", True)):
-        time_cfg = config.get("time_feature_flags", {})
-        engineered = create_time_features(engineered, timestamp_column, time_cfg)
-
     return engineered.dropna().reset_index(drop=True)
+
+
+def append_time_features(
+    dataframe: pd.DataFrame,
+    timestamp_column: str,
+    config: Dict[str, object],
+) -> pd.DataFrame:
+    """Append configured timestamp-derived features after normalization."""
+    if bool(config.get("add_time_features", False)):
+        time_cfg = config.get("time_feature_flags", {})
+        return create_time_features(dataframe, timestamp_column, time_cfg).dropna().reset_index(drop=True)
+
+    return dataframe.copy().dropna().reset_index(drop=True)

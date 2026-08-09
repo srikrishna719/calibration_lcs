@@ -32,18 +32,24 @@ def summarize_missing_values(dataframe: pd.DataFrame) -> pd.DataFrame:
 
 def create_missing_value_heatmap(
     dataframe: pd.DataFrame,
+    timestamp_column: Optional[str] = None,
     title: str = "Missing Data Plot",
-    x_label: str = "Row Index",
+    x_label: str = "Timestamp",
     y_label: str = "Column",
 ) -> go.Figure:
     """Create a heatmap showing the position of missing values across columns."""
     missing_matrix = dataframe.isna().astype(int)
+    if timestamp_column and timestamp_column in dataframe.columns:
+        x_values = pd.to_datetime(dataframe[timestamp_column], errors="coerce")
+    else:
+        x_values = list(range(len(dataframe)))
+        x_label = "Row Index"
     fig = go.Figure(
         data=go.Heatmap(
             z=missing_matrix.values.T,
-            x=list(range(len(dataframe))),
+            x=x_values,
             y=list(missing_matrix.columns),
-            colorscale=[[0, "#1e1b4b"], [1, "#ef4444"]],
+            colorscale=[[0, "#e5e7eb"], [1, "#dc2626"]],
             showscale=True,
             colorbar=dict(title="Missing", tickvals=[0, 1], ticktext=["Present", "Missing"]),
         )
@@ -54,6 +60,8 @@ def create_missing_value_heatmap(
         yaxis_title=y_label,
         template="plotly_dark",
         height=max(300, len(missing_matrix.columns) * 28),
+        font=dict(size=14),
+        title_font=dict(size=20),
     )
     return fig
 
@@ -102,13 +110,16 @@ def create_distribution_figure(
         nbins=30,
         marginal="box",
         title=chart_title,
-        color_discrete_sequence=["#6366f1"],
+        color_discrete_sequence=["#2563eb"],
     )
     fig.update_layout(
         xaxis_title=x_label or column,
         yaxis_title=y_label,
         template="plotly_dark",
+        font=dict(size=14),
+        title_font=dict(size=20),
     )
+    fig.update_traces(marker_line_color="#111827", marker_line_width=0.5)
     return fig
 
 
@@ -226,6 +237,8 @@ def create_time_series_figure(
         yaxis_title="Value",
         template="plotly_dark",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+        font=dict(size=14),
+        title_font=dict(size=20),
     )
     return fig
 
@@ -267,6 +280,8 @@ def create_anomaly_figure(
         xaxis_title="Time",
         yaxis_title=value_column,
         template="plotly_dark",
+        font=dict(size=14),
+        title_font=dict(size=20),
     )
     return fig
 
@@ -311,7 +326,7 @@ def generate_eda_outputs(
         "numeric_columns": numeric_columns,
         "distribution_figure": create_distribution_figure(dataframe, distribution_column),
         "correlation_figure": create_correlation_heatmap(dataframe),
-        "missing_heatmap": create_missing_value_heatmap(dataframe),
+        "missing_heatmap": create_missing_value_heatmap(dataframe, timestamp_column),
         "scatter_matrix_figure": create_scatter_plot_matrix(dataframe, numeric_columns[:4]),
         "time_series_figure": create_time_series_figure(dataframe, timestamp_column),
         "anomaly_figure": create_anomaly_figure(

@@ -23,7 +23,11 @@ def _plotly_png_bytes(fig: "go.Figure") -> tuple[Optional[bytes], Optional[str]]
     try:
         return fig.to_image(format="png", width=1200, height=700, scale=2), None
     except Exception as exc:  # pragma: no cover - depends on kaleido/runtime support
-        return None, f"PNG export is unavailable: {exc}"
+        return (
+            None,
+            "PNG export is unavailable. Plotly/Kaleido may need a compatible browser runtime. "
+            f"Details: {exc}",
+        )
 
 
 def render_df_download(
@@ -78,3 +82,6 @@ def render_chart_download(
                 help="Download the exact source data used to build this chart",
                 width='stretch',
             )
+
+    if png_error:
+        st.caption(png_error)

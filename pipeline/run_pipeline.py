@@ -26,13 +26,15 @@ from modules.exporter import (
     export_config_json_bytes,
     export_config_yaml_bytes,
     export_dataframe_csv_bytes,
+    export_all_model_metrics_json_bytes,
     export_metadata_json_bytes,
     export_metrics_json_bytes,
     export_model_bytes,
+    export_research_report_pdf,
     export_model_summary_report_pdf,
     export_project_run_json_bytes,
 )
-from modules.feature_engineering import engineer_features
+from modules.feature_engineering import append_time_features, engineer_sensor_features
 from modules.normalization import get_normalization_summary, normalize_dataset
 from modules.preprocessing import preprocess_dataset
 
@@ -205,7 +207,7 @@ def run_modeling_stage(
     ts_col = str(data_cfg["timestamp_column"])
     target_col = f"{data_cfg['reference_prefix']}_{data_cfg['target_column']}"
 
-    featured_df = engineer_features(
+    featured_df = engineer_sensor_features(
         dataframe=merged_df,
         timestamp_column=ts_col,
         target_column=target_col,
@@ -233,6 +235,12 @@ def run_modeling_stage(
             "columns": norm_cols,
             "summary": get_normalization_summary(before_norm, featured_df, norm_cols),
         }
+
+    featured_df = append_time_features(
+        dataframe=featured_df,
+        timestamp_column=ts_col,
+        config=config["feature_engineering"],
+    )
 
     results = train_models(
         dataframe=featured_df,
@@ -378,16 +386,25 @@ def build_export_bundle(
     metrics: Dict[str, Any],
     feature_names: list,
     config: Dict[str, Any],
+    full_calibrated_dataset: Any = None,
     coefficient_table: Any = None,
     selected_target: Optional[str] = None,
     selected_predictors: Optional[List[str]] = None,
     modelling_objective: Optional[str] = None,
+    leaderboard: Any = None,
+    training_results: Optional[Dict[str, Any]] = None,
+    prepared_dataset: Any = None,
 ) -> Dict[str, bytes]:
     """Create exportable artefacts for the selected model."""
     bundle = {
         "calibrated_dataset_csv": export_dataframe_csv_bytes(calibrated_dataset),
         "model_pickle": export_model_bytes(selected_model),
         "metrics_json": export_metrics_json_bytes(metrics),
+        "all_model_metrics_json": export_all_model_metrics_json_bytes(
+            training_results=training_results,
+            leaderboard=leaderboard,
+            best_model_name=model_name,
+        ),
         "config_json": export_config_json_bytes(config),
         "config_yaml": export_config_yaml_bytes(config),
         "metadata_json": export_metadata_json_bytes(
@@ -400,11 +417,13 @@ def build_export_bundle(
             config=config,
             selected_target=selected_target,
             selected_predictors=selected_predictors,
-            model_names=[model_name],
+            model_names=list(training_results.keys()) if training_results else [model_name],
             metrics=metrics,
             modelling_objective=modelling_objective,
         ),
     }
+    if full_calibrated_dataset is not None:
+        bundle["full_calibrated_dataset_csv"] = export_dataframe_csv_bytes(full_calibrated_dataset)
 
     # PDF report
     pdf_bytes = export_model_summary_report_pdf(
@@ -416,6 +435,21 @@ def build_export_bundle(
     )
     if pdf_bytes:
         bundle["model_summary_pdf"] = pdf_bytes
+
+    research_pdf_bytes = export_research_report_pdf(
+        model_name=model_name,
+        metrics=metrics,
+        feature_names=feature_names,
+        config=config,
+        leaderboard=leaderboard,
+        training_results=training_results,
+        prepared_dataset=prepared_dataset,
+        selected_target=selected_target,
+        selected_predictors=selected_predictors,
+        modelling_objective=modelling_objective,
+    )
+    if research_pdf_bytes:
+        bundle["research_report_pdf"] = research_pdf_bytes
 
     return bundle
 
@@ -450,6 +484,9 @@ def run_full_pipeline(
         metrics=modeling["best_model_metrics"],
         feature_names=best_result.feature_names,
         config=config,
+        leaderboard=modeling["leaderboard"],
+        training_results=modeling["training_results"],
+        prepared_dataset=modeling["featured_data"],
     )
     return {
         **data,

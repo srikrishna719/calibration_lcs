@@ -37,6 +37,18 @@ def _pearson(x: np.ndarray, y: np.ndarray) -> float:
     return float(np.corrcoef(x[mask], y[mask])[0, 1])
 
 
+def _result_predictions(result, prediction_scope: str = "full") -> pd.DataFrame:
+    """Return the requested prediction dataframe from a TrainingResult-like object."""
+    if prediction_scope == "validation":
+        validation = getattr(result, "validation_predictions", None)
+        if isinstance(validation, pd.DataFrame) and not validation.empty:
+            return validation.copy()
+        test_predictions = getattr(result, "test_predictions", None)
+        if isinstance(test_predictions, pd.DataFrame) and not test_predictions.empty:
+            return test_predictions.copy()
+    return result.full_predictions.copy()
+
+
 # ---------------------------------------------------------------------------
 # Single-model scatter with 1:1 + OLS fit
 # ---------------------------------------------------------------------------
@@ -77,7 +89,7 @@ def create_scatter_with_fit(
         x=[lo, hi], y=[lo, hi],
         mode="lines",
         name="1:1 Line (ideal)",
-        line=dict(color="#f59e0b", dash="dash", width=2),
+        line=dict(color="#111827", dash="dash", width=3),
     ))
 
     # OLS regression fit
@@ -87,7 +99,7 @@ def create_scatter_with_fit(
             x=xr, y=yf,
             mode="lines",
             name=f"OLS Fit  slope={slope:.3f}  int={intercept:.3f}",
-            line=dict(color="#10b981", width=2),
+            line=dict(color="#dc2626", width=3),
         ))
 
     # Pearson r annotation
@@ -107,8 +119,13 @@ def create_scatter_with_fit(
         xaxis_title="Actual (Reference)",
         yaxis_title="Predicted (Calibrated)",
         template="plotly_dark",
+        plot_bgcolor="#ffffff",
+        paper_bgcolor="#ffffff",
+        font=dict(color="#111827", size=13),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
     )
+    fig.update_xaxes(gridcolor="#e5e7eb", linecolor="#111827", zerolinecolor="#9ca3af")
+    fig.update_yaxes(gridcolor="#e5e7eb", linecolor="#111827", zerolinecolor="#9ca3af")
     return fig
 
 
@@ -171,6 +188,7 @@ def create_bland_altman_plot(
 def create_multi_model_scatter(
     training_results: Dict,
     max_cols: int = 3,
+    prediction_scope: str = "full",
 ) -> go.Figure:
     """Subplot grid: scatter + 1:1 + OLS fit for every trained model."""
     model_names = list(training_results.keys())
@@ -191,7 +209,7 @@ def create_multi_model_scatter(
 
     for idx, name in enumerate(model_names):
         result = training_results[name]
-        pdf = result.full_predictions
+        pdf = _result_predictions(result, prediction_scope)
         actual = pdf["actual"].values.astype(float)
         predicted = pdf["predicted"].values.astype(float)
         color = palette[idx % len(palette)]
@@ -209,7 +227,7 @@ def create_multi_model_scatter(
         hi = float(max(np.nanmax(actual), np.nanmax(predicted)))
         fig.add_trace(go.Scatter(
             x=[lo, hi], y=[lo, hi], mode="lines",
-            line=dict(color="#f59e0b", dash="dash", width=1.5),
+            line=dict(color="#111827", dash="dash", width=2.5),
             showlegend=False,
         ), row=row, col=col)
 
@@ -217,7 +235,7 @@ def create_multi_model_scatter(
             _, _, xr, yf = fit_result
             fig.add_trace(go.Scatter(
                 x=xr, y=yf, mode="lines",
-                line=dict(color="#10b981", width=1.5),
+                line=dict(color="#dc2626", width=2.5),
                 showlegend=False,
             ), row=row, col=col)
 
@@ -232,9 +250,16 @@ def create_multi_model_scatter(
 
     fig.update_layout(
         title="Multi-Model Scatter: Predicted vs Actual (with 1:1 & OLS lines)",
-        template="plotly_dark",
+        template="plotly_white",
+        plot_bgcolor="#ffffff",
+        paper_bgcolor="#ffffff",
+        font=dict(color="#111827", size=12),
         height=320 * rows,
+        margin=dict(t=90, b=70, l=60, r=30),
     )
+    fig.update_annotations(font_size=12)
+    fig.update_xaxes(gridcolor="#e5e7eb", linecolor="#111827", zerolinecolor="#9ca3af")
+    fig.update_yaxes(gridcolor="#e5e7eb", linecolor="#111827", zerolinecolor="#9ca3af")
     return fig
 
 
@@ -242,13 +267,13 @@ def create_multi_model_scatter(
 # Multi-model time-series overlay
 # ---------------------------------------------------------------------------
 
-def create_multi_model_timeseries(training_results: Dict) -> go.Figure:
+def create_multi_model_timeseries(training_results: Dict, prediction_scope: str = "full") -> go.Figure:
     """Overlay time-series of all model predictions against the reference."""
     if not training_results:
         return go.Figure()
 
     first = next(iter(training_results.values()))
-    base = first.full_predictions.sort_values("timestamp")
+    base = _result_predictions(first, prediction_scope).sort_values("timestamp")
     palette = ["#6366f1", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6"]
 
     fig = go.Figure()
@@ -259,7 +284,7 @@ def create_multi_model_timeseries(training_results: Dict) -> go.Figure:
     ))
 
     for idx, (name, result) in enumerate(training_results.items()):
-        df = result.full_predictions.sort_values("timestamp")
+        df = _result_predictions(result, prediction_scope).sort_values("timestamp")
         fig.add_trace(go.Scatter(
             x=df["timestamp"], y=df["predicted"],
             mode="lines", name=name,
@@ -271,6 +296,7 @@ def create_multi_model_timeseries(training_results: Dict) -> go.Figure:
         xaxis_title="Time", yaxis_title="Concentration",
         template="plotly_dark",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+        margin=dict(t=90, b=70, l=60, r=30),
     )
     return fig
 
@@ -308,7 +334,10 @@ def create_multi_model_metrics_bar(leaderboard: pd.DataFrame) -> go.Figure:
         title="Multi-Model Metric Comparison",
         template="plotly_dark",
         barmode="group",
-        height=420,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+        height=500,
+        margin=dict(t=95, b=110, l=60, r=30),
+        legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5),
     )
+    fig.update_annotations(font_size=12)
+    fig.update_xaxes(tickangle=-30)
     return fig
