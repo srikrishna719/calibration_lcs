@@ -17,7 +17,7 @@ except ImportError:  # pragma: no cover
 
 from evaluation.comparator import create_leaderboard, select_best_model
 from models.predict import predict_with_model
-from models.train import train_models
+from models.train import fitted_scaler, train_models
 from modules.alignment import align_and_merge_datasets
 from modules.data_loader import load_and_validate_dataset
 from modules.drift_analysis import generate_post_analysis_outputs
@@ -216,24 +216,24 @@ def run_modeling_stage(
     if featured_df.empty:
         raise ValueError("Feature engineering removed all rows. Adjust lag or rolling settings.")
 
-    # Apply normalization if configured.
+    # Normalization is applied *inside* each model (see build_estimator), so the
+    # scaler is fit per training fold and ships with the exported model. The
+    # frame handed to training therefore stays unscaled; what is computed here
+    # is a descriptive preview of what that scaling does.
     norm_cfg = config.get("normalization", {})
     norm_method = str(norm_cfg.get("method", "none"))
-    scaler = None
     normalization_outputs = None
     if norm_method.strip().lower() != "none":
         norm_cols = [c for c in featured_df.columns if c not in [ts_col, target_col]]
-        before_norm = featured_df.copy()
-        featured_df, scaler = normalize_dataset(
-            featured_df,
-            norm_cols,
-            norm_method,
-            return_scaler=True,
-        )
         normalization_outputs = {
             "method": norm_method,
             "columns": norm_cols,
-            "summary": get_normalization_summary(before_norm, featured_df, norm_cols),
+            "summary": get_normalization_summary(
+                featured_df,
+                normalize_dataset(featured_df, norm_cols, norm_method),
+                norm_cols,
+            ),
+            "preview_only": True,
         }
 
     featured_df = append_time_features(
@@ -249,6 +249,7 @@ def run_modeling_stage(
         config=config["training"],
         random_state=int(config.get("app", {}).get("random_state", 42)),
         feature_subset=feature_subset,
+        normalization_method=norm_method,
     )
     leaderboard = create_leaderboard(results, config["evaluation"])
     best = select_best_model(results, leaderboard)
@@ -275,7 +276,7 @@ def run_modeling_stage(
         "best_model": best.model,
         "best_model_metrics": best.metrics,
         "calibrated_dataset": calibrated,
-        "scaler": scaler,
+        "scaler": fitted_scaler(best.model),
         "normalization_outputs": normalization_outputs,
     }
 
@@ -285,6 +286,7 @@ def train_on_prepared_dataset(
     target_column: str,
     config: Dict[str, Any],
     feature_subset: list | None = None,
+    normalization_method: str | None = None,
 ) -> Dict[str, Any]:
     """Train models on an already-prepared dataset.
 
@@ -305,6 +307,10 @@ def train_on_prepared_dataset(
         Pipeline configuration dict.
     feature_subset:
         Optional list of feature columns to restrict training.
+    normalization_method:
+        Scaler to compose into each model. ``prepared_df`` must be unscaled —
+        the scaler is fit per training fold and stored inside the fitted model.
+        Defaults to ``config["normalization"]["method"]``.
 
     Returns
     -------
@@ -312,6 +318,8 @@ def train_on_prepared_dataset(
         Same keys as :func:`run_modeling_stage`.
     """
     ts_col = str(config["data"]["timestamp_column"])
+    if normalization_method is None:
+        normalization_method = str(config.get("normalization", {}).get("method", "none"))
 
     if prepared_df is None or len(prepared_df) == 0:
         raise ValueError("Prepared dataset is empty. Revisit the preparation steps.")
@@ -327,6 +335,7 @@ def train_on_prepared_dataset(
         config=config["training"],
         random_state=int(config.get("app", {}).get("random_state", 42)),
         feature_subset=feature_subset,
+        normalization_method=normalization_method,
     )
     leaderboard = create_leaderboard(results, config["evaluation"])
     best = select_best_model(results, leaderboard)
@@ -353,7 +362,7 @@ def train_on_prepared_dataset(
         "best_model": best.model,
         "best_model_metrics": best.metrics,
         "calibrated_dataset": calibrated,
-        "scaler": None,
+        "scaler": fitted_scaler(best.model),
         "normalization_outputs": None,
     }
 

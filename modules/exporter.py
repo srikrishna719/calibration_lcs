@@ -244,6 +244,9 @@ def build_metadata(
     Dict[str, Any]
         Metadata dictionary with provenance information.
     """
+    normalization_method = str(
+        _nested_config_value(config, ("normalization", "method"), "none") or "none"
+    )
     return {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "model_name": model_name,
@@ -258,7 +261,15 @@ def build_metadata(
             "outlier_method": config.get("preprocessing", {}).get("outlier_method"),
             "test_size": config.get("training", {}).get("test_size"),
             "random_state": config.get("app", {}).get("random_state"),
+            "normalization_method": normalization_method,
         },
+        "model_pickle_contains_scaler": normalization_method != "none",
+        "model_input_expectation": (
+            "Raw (unscaled) feature columns in features_used order; the pickled "
+            "estimator applies the fitted scaler itself."
+            if normalization_method != "none"
+            else "Feature columns in features_used order."
+        ),
         "software": "CaliSenseAQ v5.0",
     }
 

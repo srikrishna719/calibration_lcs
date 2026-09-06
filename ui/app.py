@@ -778,10 +778,16 @@ def cached_modeling(merged_df, cfg_text, feature_subset_json="null"):
 
 
 @st.cache_data(show_spinner=False)
-def cached_train_prepared(prepared_df, target_column, cfg_text, feature_subset_json="null"):
+def cached_train_prepared(
+    prepared_df, target_column, cfg_text, feature_subset_json="null", normalization_method="none"
+):
     subset = json.loads(feature_subset_json)
     return train_on_prepared_dataset(
-        prepared_df, target_column, json.loads(cfg_text), feature_subset=subset
+        prepared_df,
+        target_column,
+        json.loads(cfg_text),
+        feature_subset=subset,
+        normalization_method=normalization_method,
     )
 
 
@@ -1848,28 +1854,45 @@ def render_normalization():
     config.setdefault("normalization", {})["method"] = method
     st.session_state.config = config
 
+    if method != "none":
+        st.info(
+            "Scaling is applied **inside the model**, not to the dataset passed to training. "
+            "The scaler is re-fit on each training fold, so validation statistics never leak "
+            "into the fit behind the reported metrics, and it is stored inside the exported "
+            "model so the downloaded `model.pkl` can be applied to raw sensor readings. "
+            "The tables below preview what this scaling does to each column."
+        )
+
     if st.button("\U0001f680 Apply Normalization", key="apply_normalization", width='stretch'):
         with st.spinner("Normalizing..."):
             try:
                 norm_cols = [c for c in featured.columns if c not in [ts_col, target_col]]
                 if method == "none":
-                    normalized_base = featured.copy()
-                    summary = get_normalization_summary(featured, featured, norm_cols)
+                    preview_base = featured.copy()
                 else:
-                    before = featured.copy()
-                    normalized_base = normalize_dataset(featured.copy(), norm_cols, method)
-                    summary = get_normalization_summary(before, normalized_base, norm_cols)
+                    preview_base = normalize_dataset(featured.copy(), norm_cols, method)
+                summary = get_normalization_summary(featured, preview_base, norm_cols)
 
                 from modules.feature_engineering import append_time_features
-                normalized = append_time_features(
-                    dataframe=normalized_base,
+                time_cfg = config.get("feature_engineering", {})
+                # The modelling frame stays unscaled: train_models composes the
+                # scaler into each estimator, so it is fit per training fold and
+                # travels with the model that gets exported.
+                modelling_dataset = append_time_features(
+                    dataframe=featured.copy(),
                     timestamp_column=ts_col,
-                    config=config.get("feature_engineering", {}),
+                    config=time_cfg,
                 )
-                added_time_cols = [c for c in normalized.columns if c not in normalized_base.columns]
+                preview_dataset = append_time_features(
+                    dataframe=preview_base,
+                    timestamp_column=ts_col,
+                    config=time_cfg,
+                )
+                added_time_cols = [c for c in preview_dataset.columns if c not in preview_base.columns]
 
                 st.session_state.normalization_outputs = {
-                    "normalized_dataset": normalized,
+                    "modelling_dataset": modelling_dataset,
+                    "normalized_dataset": preview_dataset,
                     "method": method,
                     "summary": summary,
                     "added_time_columns": added_time_cols,
@@ -1901,6 +1924,11 @@ def render_normalization():
         if added_time_cols:
             st.caption(f"Time features added after normalization: {', '.join(added_time_cols)}")
         st.markdown("#### Normalized dataset preview")
+        if norm_out.get("method", "none") != "none":
+            st.caption(
+                "Preview only, for inspecting the scaling. Training receives the unscaled "
+                "frame and applies this scaler inside the model, fold by fold."
+            )
         st.dataframe(normalized.head(20), width='stretch')
         render_df_download(normalized, key="norm_dataset_csv", filename="normalized_dataset.csv")
 
@@ -1919,7 +1947,12 @@ def render_modelling():
         return
 
     config = st.session_state.config
-    model_df = st.session_state.normalization_outputs["normalized_dataset"]
+    norm_out = st.session_state.normalization_outputs
+    # Unscaled frame: the scaler is composed into each model by train_models.
+    model_df = norm_out.get("modelling_dataset")
+    if model_df is None:
+        model_df = norm_out["normalized_dataset"]
+    norm_method = str(norm_out.get("method", "none"))
     ts_col = config["data"]["timestamp_column"]
     target_col = st.session_state.selected_target
     if target_col is None or target_col not in model_df.columns:
@@ -2352,7 +2385,9 @@ def render_modelling():
             try:
                 cfg_text = _cfg_to_json(config)
                 subset_json = json.dumps(st.session_state.selected_features)
-                outputs = cached_train_prepared(model_df, target_col, cfg_text, subset_json)
+                outputs = cached_train_prepared(
+                    model_df, target_col, cfg_text, subset_json, norm_method
+                )
                 st.session_state.modeling_outputs = outputs
                 st.session_state.selected_model_name = outputs["best_model_name"]
                 _reset_downstream(*_DOWNSTREAM_FROM_MODELING)

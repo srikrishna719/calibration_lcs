@@ -74,20 +74,27 @@ def build_sample_demo_state(
     norm_method = str(config.get("normalization", {}).get("method", "none")).strip().lower()
     norm_cols = [column for column in featured.columns if column not in [ts_col, target_col]]
     if norm_method == "none":
-        normalized_base = featured.copy()
-        normalization_summary = get_normalization_summary(featured, featured, norm_cols)
+        preview_base = featured.copy()
     else:
-        before = featured.copy()
-        normalized_base = normalize_dataset(featured.copy(), norm_cols, norm_method)
-        normalization_summary = get_normalization_summary(before, normalized_base, norm_cols)
+        preview_base = normalize_dataset(featured.copy(), norm_cols, norm_method)
+    normalization_summary = get_normalization_summary(featured, preview_base, norm_cols)
 
-    normalized = append_time_features(
-        dataframe=normalized_base,
+    # Training gets the unscaled frame; the scaler is composed into each model
+    # so it is fit per fold and exported with it. ``normalized`` is display only.
+    modelling_dataset = append_time_features(
+        dataframe=featured.copy(),
         timestamp_column=ts_col,
         config=feature_config,
     )
-    added_time_columns = [column for column in normalized.columns if column not in normalized_base.columns]
-    modeling_outputs = train_on_prepared_dataset(normalized, target_col, config)
+    normalized = append_time_features(
+        dataframe=preview_base,
+        timestamp_column=ts_col,
+        config=feature_config,
+    )
+    added_time_columns = [column for column in normalized.columns if column not in preview_base.columns]
+    modeling_outputs = train_on_prepared_dataset(
+        modelling_dataset, target_col, config, normalization_method=norm_method
+    )
 
     return {
         "config": config,
@@ -102,6 +109,7 @@ def build_sample_demo_state(
         "feature_engineering_outputs": {"featured_dataset": featured},
         "featured_preview": featured,
         "normalization_outputs": {
+            "modelling_dataset": modelling_dataset,
             "normalized_dataset": normalized,
             "method": norm_method,
             "summary": normalization_summary,

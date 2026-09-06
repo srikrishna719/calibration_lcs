@@ -1,6 +1,6 @@
 pandas
 numpy
-scikit-learn
+scikit-learn>=1.2          # set_output(transform='pandas'): keeps feature names through the scaling pipeline
 xgboost
 plotly
 streamlit

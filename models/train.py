@@ -12,12 +12,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from sklearn.base import RegressorMixin
+from sklearn.base import BaseEstimator, RegressorMixin, clone
 from sklearn.model_selection import KFold, RandomizedSearchCV, TimeSeriesSplit
+from sklearn.pipeline import Pipeline
 
 from evaluation.metrics import calculate_regression_metrics
 from models.model_registry import get_selected_models
 from modules.diagnostics import compute_coefficient_table
+from modules.normalization import build_scaler
 
 try:
     import statsmodels.api as sm
@@ -60,19 +62,23 @@ _PARAM_GRIDS: Dict[str, Dict[str, list]] = {
 STATSMODELS_LINEAR_MODELS = {"ols_regression", "multiple_linear_regression"}
 
 
-class StatsmodelsOLSRegressor:
-    """Small sklearn-like wrapper around statsmodels OLS results."""
+class StatsmodelsOLSRegressor(RegressorMixin, BaseEstimator):
+    """Small sklearn-compatible wrapper around statsmodels OLS results.
+
+    Subclasses the sklearn base classes (rather than only duck-typing them) so
+    the wrapper can be composed into a ``Pipeline`` alongside a scaler, which
+    is how normalization is applied. ``BaseEstimator`` supplies get_params /
+    set_params / ``__sklearn_tags__``; only the fitted-state check needs a hand,
+    because the trailing-underscore attributes exist before ``fit``.
+    """
 
     def __init__(self) -> None:
         self.result_: Any = None
         self.feature_names_: List[str] = []
         self.design_columns_: List[str] = []
 
-    def get_params(self, deep: bool = True) -> Dict[str, object]:
-        return {}
-
-    def set_params(self, **params: object) -> "StatsmodelsOLSRegressor":
-        return self
+    def __sklearn_is_fitted__(self) -> bool:
+        return self.result_ is not None
 
     def _prepare_design(self, X: pd.DataFrame) -> pd.DataFrame:
         """Reorder ``X`` into the design matrix this model was fitted on.
@@ -137,6 +143,53 @@ class StatsmodelsOLSRegressor:
 
 
 # ---------------------------------------------------------------------------
+# Estimator construction — scaling belongs inside the model
+# ---------------------------------------------------------------------------
+
+MODEL_STEP = "model"
+SCALER_STEP = "scaler"
+
+
+def build_estimator(
+    model: RegressorMixin | StatsmodelsOLSRegressor,
+    normalization_method: str = "none",
+) -> RegressorMixin | StatsmodelsOLSRegressor | Pipeline:
+    """Compose ``model`` with a scaler when normalization is requested.
+
+    Scaling is part of the estimator rather than a prior transform of the whole
+    dataset. Two things follow, and both matter:
+
+    * The scaler is re-fit on each training fold, so validation statistics
+      never leak into the fit that produces the reported metrics.
+    * The exported pickle carries the scaler, so the model can be applied to
+      raw sensor readings instead of silently requiring the caller to
+      reproduce an unavailable transform.
+    """
+    scaler = build_scaler(normalization_method)
+    if scaler is None:
+        return model
+    return Pipeline([(SCALER_STEP, scaler), (MODEL_STEP, model)])
+
+
+def final_estimator(
+    estimator: RegressorMixin | StatsmodelsOLSRegressor | Pipeline,
+) -> RegressorMixin | StatsmodelsOLSRegressor:
+    """Return the regressor itself, unwrapping a scaling pipeline if present."""
+    if isinstance(estimator, Pipeline):
+        return estimator.named_steps[MODEL_STEP]
+    return estimator
+
+
+def fitted_scaler(
+    estimator: RegressorMixin | StatsmodelsOLSRegressor | Pipeline,
+) -> object | None:
+    """Return the fitted scaler from a pipeline, or ``None`` when unscaled."""
+    if isinstance(estimator, Pipeline):
+        return estimator.named_steps.get(SCALER_STEP)
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Data class
 # ---------------------------------------------------------------------------
 
@@ -161,6 +214,8 @@ class TrainingResult:
     validation_method: str = "timeseriessplit"
     validation_predictions: Optional[pd.DataFrame] = None
     residuals: Optional[pd.Series] = None
+    # Scaler composed into ``model``; "none" when the model takes raw features.
+    normalization_method: str = "none"
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +315,6 @@ def prepare_training_matrices(
             )
         features = features[requested]
 
-
     modelling_matrix = features.copy()
     modelling_matrix[target_column] = target
     modelling_matrix[timestamp_column] = timestamps
@@ -315,11 +369,13 @@ def _safe_folds(n_samples: int, requested_folds: int) -> int:
     return max(2, min(int(requested_folds), n_samples - 1))
 
 
-def _clone_model(model: RegressorMixin | StatsmodelsOLSRegressor) -> RegressorMixin | StatsmodelsOLSRegressor:
-    """Clone sklearn or local statsmodels-wrapper estimators."""
-    if isinstance(model, StatsmodelsOLSRegressor):
-        return StatsmodelsOLSRegressor()
-    return model.__class__(**model.get_params())
+def _clone_model(model: RegressorMixin | StatsmodelsOLSRegressor | Pipeline):
+    """Return an unfitted copy of an estimator, pipeline included.
+
+    ``sklearn.base.clone`` walks a Pipeline's steps, so the scaler is cloned
+    unfitted alongside the regressor and re-fit on each fold's training rows.
+    """
+    return clone(model)
 
 
 def _make_cv_splitter(method: str, n_samples: int, folds: int, random_state: int):
@@ -371,6 +427,10 @@ def tune_hyperparameters(
         model.fit(x_train, y_train)
         return model, {}
 
+    if isinstance(model, Pipeline):
+        # Address the regressor's params through the pipeline step name.
+        param_grid = {f"{MODEL_STEP}__{key}": values for key, values in param_grid.items()}
+
     cv = _make_cv_splitter(validation_method, len(x_train), cv_folds, random_state)
     search = RandomizedSearchCV(
         estimator=model,
@@ -383,7 +443,11 @@ def tune_hyperparameters(
         refit=True,
     )
     search.fit(x_train, y_train)
-    return search.best_estimator_, dict(search.best_params_)
+    best_params = {
+        key.split("__", 1)[-1] if key.startswith(f"{MODEL_STEP}__") else key: value
+        for key, value in search.best_params_.items()
+    }
+    return search.best_estimator_, best_params
 
 
 # ---------------------------------------------------------------------------
@@ -431,6 +495,7 @@ def train_models(
     config: Dict[str, object],
     random_state: int = 42,
     feature_subset: Optional[List[str]] = None,
+    normalization_method: str = "none",
 ) -> List[TrainingResult]:
     """Train all configured models and collect evaluation outputs.
 
@@ -448,6 +513,11 @@ def train_models(
         Random seed for reproducibility.
     feature_subset:
         Optional list of feature column names to use (overrides all features).
+    normalization_method:
+        Scaler to compose into each model ("none", "standard", "minmax",
+        "robust"). Pass the *unscaled* dataframe together with this argument
+        rather than pre-scaling: the scaler is then fit per training fold, and
+        it is stored inside the fitted model so exports work on raw data.
 
     Returns
     -------
@@ -477,6 +547,9 @@ def train_models(
         best_params: Dict[str, Any] = {}
         if model_name in STATSMODELS_LINEAR_MODELS:
             model = StatsmodelsOLSRegressor()
+
+        # Scaling travels with the estimator: fit per fold, exported with the model.
+        model = build_estimator(model, normalization_method)
 
         # --- optional tuning ---
         model_tune = tuning_cfg.get(model_name, {})
@@ -530,13 +603,14 @@ def train_models(
             "predicted": model.predict(features),
         })
 
-        importance, coefs, intercept = extract_feature_importance(model, feature_names)
+        regressor = final_estimator(model)
+        importance, coefs, intercept = extract_feature_importance(regressor, feature_names)
         coefficient_table = None
         standard_errors = None
         t_statistics = None
         p_values = None
-        if isinstance(model, StatsmodelsOLSRegressor) and model.result_ is not None:
-            coefficient_table = compute_coefficient_table(model.result_)
+        if isinstance(regressor, StatsmodelsOLSRegressor) and regressor.result_ is not None:
+            coefficient_table = compute_coefficient_table(regressor.result_)
             if coefficient_table is not None and not coefficient_table.empty:
                 standard_errors = dict(zip(
                     coefficient_table["Variable"].astype(str),
@@ -574,6 +648,7 @@ def train_models(
             validation_method=validation_method,
             validation_predictions=validation_pred_df.reset_index(drop=True),
             residuals=residuals,
+            normalization_method=normalization_method,
         ))
 
     return results
