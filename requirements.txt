@@ -5,7 +5,8 @@ pandas>=2.2
 numpy>=1.26
 scikit-learn>=1.2       # set_output(transform="pandas") keeps feature names through the scaling pipeline
 xgboost                 # optional; skipped gracefully when absent
-plotly>=5.18
+plotly>=5.18            # legend itemclick/itemdoubleclick are set explicitly, so the
+                        # PNG export cannot drift from the on-screen chart
 streamlit>=1.56         # st.download_button accepts a callable (deferred payloads); 1.56 is
                         # the version this was verified on, and every download button in the
                         # app depends on it -- an older floor was a guess, not a check
