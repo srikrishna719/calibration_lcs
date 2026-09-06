@@ -258,6 +258,7 @@ def run_modeling_stage(
         dataframe=featured_df,
         target_column=target_col,
         timestamp_column=ts_col,
+        feature_names=best.feature_names,
     )
     calibrated = (
         featured_df[[ts_col, target_col]]
@@ -335,6 +336,7 @@ def train_on_prepared_dataset(
         dataframe=prepared_df,
         target_column=target_column,
         timestamp_column=ts_col,
+        feature_names=best.feature_names,
     )
     calibrated = (
         prepared_df[[ts_col, target_column]]

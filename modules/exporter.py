@@ -16,6 +16,8 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+from modules.diagnostics import COEFFICIENT_TABLE_COLUMNS
+
 try:
     import yaml
 except ImportError:  # pragma: no cover
@@ -545,7 +547,7 @@ def export_research_report_pdf(
                 _pdf_simple_table(
                     pdf,
                     coefficient_table,
-                    ["Variable", "Coefficient", "Std Error", "t-Statistic", "P-value"],
+                    COEFFICIENT_TABLE_COLUMNS,
                     max_rows=12,
                 )
 

@@ -75,14 +75,34 @@ class StatsmodelsOLSRegressor:
         return self
 
     def _prepare_design(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Reorder ``X`` into the design matrix this model was fitted on.
+
+        Extra columns are ignored, but a feature the model was fitted on must
+        actually be supplied. Substituting zeros for a missing predictor would
+        silently return plausible-looking predictions from a different model
+        than the one that was fitted.
+        """
         X_df = pd.DataFrame(X).copy()
         if self.feature_names_:
-            X_df = X_df.reindex(columns=self.feature_names_, fill_value=0)
+            available = {str(column): column for column in X_df.columns}
+            missing = [name for name in self.feature_names_ if name not in available]
+            if missing:
+                raise ValueError(
+                    "Design matrix is missing feature column(s) the model was fitted on: "
+                    + ", ".join(missing)
+                )
+            X_df = X_df[[available[name] for name in self.feature_names_]]
+            X_df.columns = list(self.feature_names_)
+
         design = sm.add_constant(X_df, has_constant="add")
-        for column in self.design_columns_:
-            if column not in design.columns:
-                design[column] = 1.0 if column == "const" else 0.0
         if self.design_columns_:
+            missing_design = [
+                column for column in self.design_columns_ if column not in design.columns
+            ]
+            if missing_design:
+                raise ValueError(
+                    "Design matrix is missing fitted term(s): " + ", ".join(missing_design)
+                )
             design = design[self.design_columns_]
         return design
 
@@ -200,8 +220,11 @@ def prepare_training_matrices(
     Parameters
     ----------
     feature_subset:
-        If provided, only these columns are used as features.
-        Must all be present in dataframe (after dropping target/timestamp).
+        If provided, only these columns are used as features, in the order
+        given. Every name must resolve to a numeric column of ``dataframe``;
+        anything missing or non-numeric raises rather than being dropped, so a
+        stale or mistyped selection cannot silently train on other features.
+        Pass ``None`` (or an empty list) to use every numeric column.
     """
     ordered = dataframe.sort_values(timestamp_column).reset_index(drop=True)
     if target_column not in ordered.columns:
@@ -216,9 +239,27 @@ def prepare_training_matrices(
     )
 
     if feature_subset:
-        valid_subset = [c for c in feature_subset if c in features.columns]
-        if valid_subset:
-            features = features[valid_subset]
+        requested = [str(column) for column in feature_subset]
+        missing = [column for column in requested if column not in features.columns]
+        if missing:
+            unknown = [column for column in missing if column not in ordered.columns]
+            non_numeric = [column for column in missing if column in ordered.columns]
+            details = []
+            if unknown:
+                details.append(
+                    "not found in the modelling dataset: " + ", ".join(unknown)
+                )
+            if non_numeric:
+                details.append(
+                    "present but not numeric: " + ", ".join(non_numeric)
+                )
+            raise ValueError(
+                "Selected feature column(s) cannot be used for training: "
+                + "; ".join(details)
+                + ". Revisit the Feature Subset selection."
+            )
+        features = features[requested]
+
 
     modelling_matrix = features.copy()
     modelling_matrix[target_column] = target

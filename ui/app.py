@@ -69,7 +69,7 @@ from modules.drift_analysis import (
 )
 from modules.download_helpers import render_chart_download, render_df_download
 from modules.normalization import get_normalization_summary, normalize_dataset
-from modules.diagnostics import compute_vif, shapiro_wilk_test
+from modules.diagnostics import COEFFICIENT_TABLE_COLUMNS, compute_vif, shapiro_wilk_test
 from modules.plots import (
     create_bland_altman_plot,
     create_multi_model_metrics_bar,
@@ -606,13 +606,13 @@ def _best_row_style(row: pd.Series) -> list:
 def _format_coefficient_table(coef_table) -> pd.DataFrame:
     """Format a coefficient table with proper decimal places."""
     if coef_table is None or (isinstance(coef_table, pd.DataFrame) and coef_table.empty):
-        return pd.DataFrame(columns=["Variable", "Coefficient", "Std Error", "t-Statistic", "P-value"])
+        return pd.DataFrame(columns=COEFFICIENT_TABLE_COLUMNS)
     df = coef_table.copy()
-    for col in ["Coefficient", "Std Error", "t-Statistic"]:
+    for col in ["Coefficient", "Std Error", "t-statistic"]:
         if col in df.columns:
             df[col] = df[col].round(2)
-    if "P-value" in df.columns:
-        df["P-value"] = df["P-value"].apply(lambda x: f"{x:.4f}" if isinstance(x, float) else x)
+    if "p-value" in df.columns:
+        df["p-value"] = df["p-value"].apply(lambda x: f"{x:.4f}" if isinstance(x, float) else x)
     return df
 
 
@@ -1456,6 +1456,19 @@ def render_alignment():
             + info_pill(f"Lag column: {meta['lag_detection_column']}")
         )
         st.markdown(pills, unsafe_allow_html=True)
+
+        dropped = meta.get("dropped_non_numeric_columns", {}) or {}
+        dropped_notes = [
+            f"{label.capitalize()}: {', '.join(columns)}"
+            for label, columns in dropped.items()
+            if columns
+        ]
+        if dropped_notes:
+            st.caption(
+                "Non-numeric columns were excluded from resampling (they cannot be aggregated) — "
+                + " | ".join(dropped_notes)
+            )
+
         st.dataframe(out["merged_data"].head(20), width='stretch')
         render_df_download(out["merged_data"], key="merged_data_csv", filename="merged_aligned_data.csv")
 
@@ -2723,7 +2736,13 @@ def render_export():
     ts_col = config["data"]["timestamp_column"]
     target_col = st.session_state.selected_target or f"{config['data']['reference_prefix']}_{config['data']['target_column']}"
 
-    predictions = predict_with_model(result.model, out["featured_data"], target_col, ts_col)
+    predictions = predict_with_model(
+        result.model,
+        out["featured_data"],
+        target_col,
+        ts_col,
+        feature_names=result.feature_names,
+    )
     calibrated = (
         out["featured_data"][[ts_col, target_col]]
         .merge(predictions, on=ts_col, how="left")
