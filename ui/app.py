@@ -65,7 +65,7 @@ from models.model_registry import MODEL_GROUPS, MODEL_DISPLAY_NAMES
 from modules.download_helpers import render_chart_download, render_df_download
 from config.validation import load_config_text
 from evaluation.metrics import MAPE_MIN_DENOMINATOR
-from modules.data_loader import summarize_duplicate_timestamps
+from modules.data_loader import list_excel_sheets, read_tabular, summarize_duplicate_timestamps
 from modules.feature_engineering import dataset_span_days, monotonic_time_features
 from modules.leakage import find_reference_encoding_columns, find_target_encoding_columns
 from modules.normalization import get_normalization_summary, normalize_dataset
@@ -709,12 +709,47 @@ def go_next():
 # Resolve data inputs
 # ---------------------------------------------------------------------------
 
-def resolve_inputs(ref_file, sen_file, use_sample):
+def resolve_inputs(ref_file, sen_file, use_sample, ref_sheet=None, sen_sheet=None):
+    """Load the two input datasets, from uploads or the bundled samples.
+
+    read_tabular rewinds before reading, which matters here: the Upload step
+    reads each upload more than once per interaction -- to look for repeated
+    timestamps and to list workbook sheets -- and pandas leaves a file object at
+    EOF, so an unrewound second read reports "No columns to parse from file".
+    """
     if ref_file is not None and sen_file is not None:
-        return pd.read_csv(ref_file), pd.read_csv(sen_file), "Uploaded files"
+        return (
+            read_tabular(ref_file, sheet_name=ref_sheet),
+            read_tabular(sen_file, sheet_name=sen_sheet),
+            "Uploaded files",
+        )
     if use_sample:
-        return pd.read_csv(DEFAULT_REF), pd.read_csv(DEFAULT_LCS), "Bundled sample data"
-    raise ValueError("Upload both CSVs or enable the sample datasets.")
+        return read_tabular(DEFAULT_REF), read_tabular(DEFAULT_LCS), "Bundled sample data"
+    raise ValueError("Upload both files or enable the sample datasets.")
+
+
+def _select_worksheet(upload, label: str, key: str):
+    """Ask which sheet to use, when a workbook holds more than one.
+
+    Workbooks routinely carry summaries and lookup tables beside the data, so
+    silently taking the first sheet would sometimes load the wrong thing without
+    saying so.
+    """
+    if upload is None:
+        return None
+    try:
+        sheets = list_excel_sheets(upload)
+    except ImportError as exc:
+        st.error(f"❌ {exc}")
+        return None
+    if len(sheets) <= 1:
+        return sheets[0] if sheets else None
+    return st.selectbox(
+        f"{label} — worksheet",
+        sheets,
+        key=key,
+        help="This workbook has several sheets. Pick the one holding the measurements.",
+    )
 
 
 def resolve_config(uploaded_file):
@@ -746,24 +781,27 @@ def render_upload():
     col1, col2 = st.columns(2)
     with col1:
         ref_file = st.file_uploader(
-            "Reference CSV",
-            type=["csv"],
+            "Reference CSV or Excel",
+            type=["csv", "xlsx", "xlsm", "xls"],
             key="ref_upload",
             help=(
-                "CSV from your reference-grade instrument (e.g. TEOM, BAM, GRIMM, AQMS). "
-                "Must contain a timestamp column and at least one pollutant column (e.g. pm25, no2). "
-                "Timestamps should be ISO 8601 (e.g. 2024-01-01 10:00:00) or Unix epoch."
+                "CSV or Excel workbook from your reference-grade instrument (e.g. TEOM, BAM, "
+                "GRIMM, AQMS). Must contain a timestamp column and at least one pollutant "
+                "column (e.g. pm25, no2). Timestamps should be ISO 8601 "
+                "(e.g. 2024-01-01 10:00:00) or Unix epoch. A workbook with several sheets "
+                "will ask which one to use."
             ),
         )
     with col2:
         sen_file = st.file_uploader(
-            "LCS (Sensor) CSV",
-            type=["csv"],
+            "LCS (Sensor) CSV or Excel",
+            type=["csv", "xlsx", "xlsm", "xls"],
             key="sen_upload",
             help=(
-                "CSV from your low-cost sensor (e.g. OPC-N3, SPS30, PMS5003, AirVisual). "
-                "Must contain the same timestamp column as the reference file. "
-                "Can include multiple sensor channels — you will pick which ones to use later."
+                "CSV or Excel workbook from your low-cost sensor (e.g. OPC-N3, SPS30, "
+                "PMS5003, AirVisual). Must contain the same timestamp column as the "
+                "reference file. Can include multiple sensor channels — you will pick which "
+                "ones to use later."
             ),
         )
 
@@ -886,11 +924,17 @@ def render_upload():
         config["data"]["target_column"] = target_col
         config["data"]["timezone"] = tz
 
+    # ---- Worksheet choice, for uploads that are workbooks ----
+    ref_sheet = _select_worksheet(ref_file, "Reference", "ref_sheet_select")
+    sen_sheet = _select_worksheet(sen_file, "LCS (Sensor)", "sen_sheet_select")
+
     # ---- Repeated timestamps: several series in one file ----
     # Resolved here rather than at load time, because keeping one arbitrary row
     # per timestamp silently interleaves co-located devices.
     try:
-        _ref_preview, _sen_preview, _ = resolve_inputs(ref_file, sen_file, use_sample)
+        _ref_preview, _sen_preview, _ = resolve_inputs(
+            ref_file, sen_file, use_sample, ref_sheet, sen_sheet
+        )
     except Exception:
         _ref_preview = _sen_preview = None
 
@@ -987,7 +1031,9 @@ def render_upload():
     if st.button("🚀 Load & Validate Data", key="run_upload", width='stretch',
                  help="Loads, parses and validates both CSV files. Any format errors will be shown below."):
         try:
-            ref_src, sen_src, label = resolve_inputs(ref_file, sen_file, use_sample)
+            ref_src, sen_src, label = resolve_inputs(
+                ref_file, sen_file, use_sample, ref_sheet, sen_sheet
+            )
             config = resolve_config(cfg_file)
             config["data"]["timestamp_column"] = ts_col
             config["data"]["target_column"] = target_col

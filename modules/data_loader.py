@@ -73,13 +73,66 @@ class DuplicateTimestampSummary:
         return text
 
 
-def load_csv(source: DataSource) -> pd.DataFrame:
-    """Load a CSV dataset or clone an existing DataFrame.
+EXCEL_SUFFIXES = frozenset({".xlsx", ".xlsm", ".xltx", ".xltm", ".xls"})
+SUPPORTED_SUFFIXES = frozenset({".csv", ".txt"}) | EXCEL_SUFFIXES
+
+
+def source_name(source: DataSource) -> str:
+    """Best-effort filename for a path or an uploaded file object."""
+    if isinstance(source, (str, Path)):
+        return str(source)
+    return str(getattr(source, "name", "") or "")
+
+
+def is_excel_source(source: DataSource) -> bool:
+    """Whether a source should be read as a workbook rather than delimited text."""
+    return Path(source_name(source)).suffix.lower() in EXCEL_SUFFIXES
+
+
+def _rewind(source: DataSource) -> None:
+    """Return an uploaded stream to the start.
+
+    A file object handed over by the UI is read more than once per interaction,
+    and pandas leaves it at EOF. Without this the second read sees an empty
+    stream and reports "No columns to parse from file", which describes the
+    symptom rather than the cause.
+    """
+    if hasattr(source, "seek"):
+        try:
+            source.seek(0)
+        except (OSError, ValueError):  # pragma: no cover - non-seekable stream
+            pass
+
+
+def list_excel_sheets(source: DataSource) -> List[str]:
+    """Sheet names in a workbook, or an empty list for anything else.
+
+    A workbook often holds summaries and lookups beside the data, so the caller
+    has to be able to ask which sheet is wanted rather than assume the first.
+    """
+    if isinstance(source, pd.DataFrame) or not is_excel_source(source):
+        return []
+    _rewind(source)
+    try:
+        with pd.ExcelFile(source) as workbook:
+            return [str(name) for name in workbook.sheet_names]
+    except ImportError as exc:
+        raise ImportError(
+            "Reading Excel files needs the openpyxl package: pip install openpyxl"
+        ) from exc
+    finally:
+        _rewind(source)
+
+
+def read_tabular(source: DataSource, sheet_name: Optional[str] = None) -> pd.DataFrame:
+    """Load a CSV or Excel dataset, or clone an existing DataFrame.
 
     Parameters
     ----------
     source:
         File path, file-like object, or DataFrame.
+    sheet_name:
+        Worksheet to read. Ignored for CSV. Defaults to the first sheet.
 
     Returns
     -------
@@ -88,7 +141,25 @@ def load_csv(source: DataSource) -> pd.DataFrame:
     """
     if isinstance(source, pd.DataFrame):
         return source.copy()
+
+    _rewind(source)
+    if is_excel_source(source):
+        try:
+            frame = pd.read_excel(source, sheet_name=sheet_name or 0)
+        except ImportError as exc:
+            raise ImportError(
+                "Reading Excel files needs the openpyxl package: pip install openpyxl"
+            ) from exc
+        if isinstance(frame, dict):  # pragma: no cover - only when sheet_name is None-like
+            frame = next(iter(frame.values()))
+        return frame.copy()
+
     return pd.read_csv(source).copy()
+
+
+def load_csv(source: DataSource) -> pd.DataFrame:
+    """Backwards-compatible alias for :func:`read_tabular`."""
+    return read_tabular(source)
 
 
 def validate_dataset(
@@ -295,6 +366,7 @@ def load_and_validate_dataset(
     group_column: Optional[str] = None,
     group_value: Optional[object] = None,
     return_summary: bool = False,
+    sheet_name: Optional[str] = None,
 ) -> pd.DataFrame | Tuple[pd.DataFrame, DuplicateTimestampSummary]:
     """Load, validate, and normalize a dataset in one step.
 
@@ -320,7 +392,7 @@ def load_and_validate_dataset(
         Cleanly loaded dataset, or ``(dataset, summary)`` when
         ``return_summary`` is set.
     """
-    dataframe = load_csv(source)
+    dataframe = read_tabular(source, sheet_name=sheet_name)
     validated = validate_dataset(
         dataframe=dataframe,
         timestamp_column=timestamp_column,

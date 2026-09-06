@@ -9,6 +9,7 @@ plotly>=5.18
 streamlit>=1.56         # st.download_button accepts a callable (deferred payloads); 1.56 is
                         # the version this was verified on, and every download button in the
                         # app depends on it -- an older floor was a guess, not a check
+openpyxl>=3.1           # reading .xlsx uploads; pandas needs an Excel engine
 PyYAML>=6.0
 scipy>=1.11
 joblib>=1.3
