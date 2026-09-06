@@ -1638,22 +1638,70 @@ def render_variable_selection():
         st.error("No numeric columns available for variable selection.")
         return
 
+    data_cfg = config["data"]
+    reference_prefix = str(data_cfg.get("reference_prefix", "reference"))
+    sensor_prefix = str(data_cfg.get("sensor_prefix", "sensor"))
+
     st.markdown("Select the **target** (reference) variable and **predictor** (sensor) variables.")
 
+    # Default to the configured reference target rather than whichever numeric
+    # column happens to sort first.
+    configured_target = f"{reference_prefix}_{data_cfg.get('target_column', '')}"
+    target_index = numeric_cols.index(configured_target) if configured_target in numeric_cols else 0
     target = st.selectbox(
         "Target variable (what you are calibrating against)",
         numeric_cols,
-        index=0,
+        index=target_index,
         key="var_sel_target",
         help="The reference measurement column that the model should predict.",
     )
 
     predictor_options = [c for c in numeric_cols if c != target]
-    default_predictors = [c for c in predictor_options if c in (st.session_state.selected_predictors or predictor_options)]
+    reference_options = [c for c in predictor_options if c.startswith(f"{reference_prefix}_")]
+    sensor_options = [c for c in predictor_options if c.startswith(f"{sensor_prefix}_")]
+    other_options = [
+        c for c in predictor_options
+        if c not in reference_options and c not in sensor_options
+    ]
+    deployable = sensor_options + other_options
+
+    # Reference-station columns are measured by the instrument being calibrated
+    # against. A deployed low-cost sensor will not have them, so a model that
+    # depends on them cannot actually be used -- they are opt-in, not default.
+    include_reference = False
+    if reference_options and deployable:
+        include_reference = st.checkbox(
+            f"Also offer `{reference_prefix}_*` columns as predictors",
+            value=bool(set(st.session_state.selected_predictors or []) & set(reference_options)),
+            key="var_sel_include_reference",
+            help=(
+                "Off by default. These columns come from the reference instrument, not the "
+                "sensor being calibrated, so a model trained on them cannot be applied at "
+                "deployment where only sensor readings exist. Enable only for a co-location "
+                "analysis where that is what you intend to study."
+            ),
+        )
+    elif reference_options and not deployable:
+        # Nothing matches the sensor prefix, so offering only sensor columns
+        # would leave the user with nothing to select.
+        include_reference = True
+        st.caption(
+            f"No columns match the `{sensor_prefix}_` prefix, so all numeric columns are "
+            "offered. Check the sensor/reference prefixes in the Upload step if that is "
+            "unexpected."
+        )
+
+    available = deployable + (reference_options if include_reference else [])
+    if not available:
+        available = predictor_options
+
+    previous = [c for c in (st.session_state.selected_predictors or []) if c in available]
+    default_predictors = previous or [c for c in available if c in deployable] or available
+
     predictors = st.multiselect(
         "Predictor variables (sensor features)",
-        predictor_options,
-        default=default_predictors or predictor_options,
+        available,
+        default=default_predictors,
         key="var_sel_predictors",
         help="The sensor columns used as inputs to the calibration model.",
     )
@@ -1661,6 +1709,15 @@ def render_variable_selection():
     if not predictors:
         st.warning("Select at least one predictor variable.")
         return
+
+    chosen_reference = [c for c in predictors if c in reference_options]
+    if chosen_reference:
+        st.warning(
+            "Using reference-instrument columns as predictors: "
+            f"**{', '.join(chosen_reference)}**. The resulting model needs those readings to "
+            "make a prediction, so it cannot be applied to a sensor deployed on its own. "
+            "Metrics will look better than a deployable calibration would achieve."
+        )
 
     modelling_df = merged[[ts_col, target] + predictors].copy()
     st.session_state.selected_target = target

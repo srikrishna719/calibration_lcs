@@ -187,6 +187,40 @@ def run_eda_stage(
 
 
 # -----------------------------------------------------------------------
+# Predictor selection
+# -----------------------------------------------------------------------
+
+def deployable_feature_subset(
+    dataframe: Any,
+    timestamp_column: str,
+    target_column: str,
+    config: Dict[str, Any],
+) -> Optional[List[str]]:
+    """Numeric feature columns a deployed sensor could actually supply.
+
+    Columns carrying the reference prefix are measurements from the instrument
+    being calibrated *against*. A model that depends on them cannot be applied
+    to a sensor running on its own, and its metrics flatter what a deployable
+    calibration would achieve, so they are excluded by default. Set
+    ``training.include_reference_predictors`` to keep them for a co-location
+    study where that is the intent.
+
+    Returns ``None`` when every feature should be used, which is the signal
+    ``train_models`` expects for "no subset".
+    """
+    if bool(config.get("training", {}).get("include_reference_predictors", False)):
+        return None
+
+    reference_prefix = str(config["data"].get("reference_prefix", "reference"))
+    numeric = dataframe.select_dtypes(include="number").columns.tolist()
+    candidates = [c for c in numeric if c not in (timestamp_column, target_column)]
+    deployable = [c for c in candidates if not str(c).startswith(f"{reference_prefix}_")]
+
+    # Nothing left to model with — fall back rather than fail.
+    return deployable or None
+
+
+# -----------------------------------------------------------------------
 # Stage 5 — Feature Engineering + Modelling
 # -----------------------------------------------------------------------
 
@@ -224,6 +258,11 @@ def run_modeling_stage(
         config=config["feature_engineering"],
     )
 
+    # Settle the predictor set before previewing, so the preview describes the
+    # columns the model will actually scale and nothing else.
+    if feature_subset is None:
+        feature_subset = deployable_feature_subset(featured_df, ts_col, target_col, config)
+
     # Normalization is applied *inside* each model (see build_estimator), so the
     # scaler is fit per training fold and ships with the exported model. The
     # frame handed to training therefore stays unscaled; what is computed here
@@ -232,7 +271,10 @@ def run_modeling_stage(
     norm_method = str(norm_cfg.get("method", "none"))
     normalization_outputs = None
     if norm_method.strip().lower() != "none":
-        norm_cols = [c for c in featured_df.columns if c not in [ts_col, target_col]]
+        norm_cols = feature_subset or [
+            c for c in featured_df.select_dtypes(include="number").columns
+            if c not in [ts_col, target_col]
+        ]
         normalization_outputs = {
             "method": norm_method,
             "columns": norm_cols,

@@ -50,6 +50,10 @@ modelling:
 
 training:
   test_size: 0.2
+  # Reference-prefixed columns are readings from the instrument being calibrated
+  # against; a deployed sensor will not have them. Set true only for co-location
+  # analysis where using them is the point.
+  include_reference_predictors: false
   cross_validation_folds: 5
   validation_method: timeseriessplit
   selected_models:

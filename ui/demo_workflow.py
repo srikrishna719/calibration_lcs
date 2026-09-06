@@ -58,7 +58,11 @@ def build_sample_demo_state(
 
     numeric_cols = [column for column in merged.select_dtypes(include="number").columns if column != ts_col]
     target_col = _reference_target_name(config, numeric_cols)
-    predictors = [column for column in numeric_cols if column != target_col]
+    # Match the app's default: reference-instrument columns are not predictors,
+    # because a deployed sensor cannot supply them.
+    reference_prefix = str(config.get("data", {}).get("reference_prefix", "reference"))
+    candidates = [column for column in numeric_cols if column != target_col]
+    predictors = [c for c in candidates if not str(c).startswith(f"{reference_prefix}_")] or candidates
     if not predictors:
         raise ValueError("Demo workflow could not find sensor predictor columns.")
 
