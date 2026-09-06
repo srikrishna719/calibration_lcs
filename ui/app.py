@@ -2700,10 +2700,15 @@ _DEFAULT_README = """\
 | 2 | **Preprocessing** | Choose missing-value strategy (interpolate_ffill / ffill / bfill / interpolate) and outlier method for sensor data. Optionally apply to reference too. |
 | 3 | **Alignment** | Resample both datasets to a common frequency, auto-detect time lag, and merge. |
 | 4 | **EDA** | Explore distributions, correlations, missing-value heatmap, and anomaly detection. |
-| 5 | **Modelling** | Configure lag/rolling/polynomial/interaction/time features; select variables; tune hyperparameters; train and compare models. |
-| 6 | **Results** | Inspect leaderboard, feature importance, scatter + time-series per model. |
-| 7 | **Post-Analysis** | Rolling error drift, Bland-Altman agreement, residual plots. |
-| 8 | **Export** | Download calibrated CSV, model .pkl, metrics JSON, config YAML/JSON, metadata JSON. |
+| 5 | **Variable Selection** | Pick the target and predictors. Reference-instrument channels and columns that encode the target are excluded by default. |
+| 6 | **Feature Engineering** | Lag, rolling, polynomial, interaction and time features. |
+| 7 | **Normalization** | Pick a scaler; it is fit inside the model, per training fold, and exported with it. |
+| 8 | **Modelling** | Select models, set hyperparameters or enable nested auto-tuning, optionally restrict the feature subset, train. |
+| 9 | **Validation & Results** | Leaderboard, metrics, explainability, multi-model comparison. |
+| 10 | **Statistical Diagnostics** | OLS coefficients, VIF, Shapiro-Wilk. *(Advanced)* |
+| 11 | **Residual Analysis** | Predicted vs actual, residual vs fitted, histogram, Q-Q plot. *(Advanced)* |
+| 12 | **README** | These notes. *(Advanced)* |
+| 13 | **Export** | Download calibrated CSV, model .pkl, metrics JSON, config YAML/JSON, metadata JSON. |
 
 ---
 
@@ -2785,7 +2790,6 @@ and gives it to the model as a new input. This lets the model learn from recent 
 - **Feature preview** lets you see all engineered columns before selecting a subset for training.
 - **Variable selection** is reset each time you click *Preview Features* — re-select your subset if needed.
 - **Reference preprocessing**: missing-value imputation always applies; outlier removal is opt-in.
-- **Bland-Altman** plot: toggle in Post-Analysis settings. Points within ±1.96σ = good agreement.
 - All exports include provenance metadata (model name, features used, metrics, config) for reproducibility.
 - Hover over any **?** icon in the UI for contextual guidance.
 

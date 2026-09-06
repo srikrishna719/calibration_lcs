@@ -1,8 +1,8 @@
-"""Enhanced plotting utilities for calibration science.
+"""Plotting utilities for calibration science.
 
-Provides scatter plots with OLS fit and 1:1 reference lines,
-Bland-Altman agreement plots, multi-model comparison figures,
-and grouped metric bar charts.
+Scatter plots with OLS fit and 1:1 reference lines, multi-model comparison
+figures, grouped metric bar charts, and the residual diagnostics shown on the
+Residual Analysis step.
 """
 
 from __future__ import annotations
@@ -126,58 +126,6 @@ def create_scatter_with_fit(
     )
     fig.update_xaxes(gridcolor="#e5e7eb", linecolor="#111827", zerolinecolor="#9ca3af")
     fig.update_yaxes(gridcolor="#e5e7eb", linecolor="#111827", zerolinecolor="#9ca3af")
-    return fig
-
-
-# ---------------------------------------------------------------------------
-# Bland-Altman agreement plot
-# ---------------------------------------------------------------------------
-
-def create_bland_altman_plot(
-    predictions_df: pd.DataFrame,
-    model_name: str = "",
-) -> go.Figure:
-    """Bland-Altman (Tukey mean-difference) agreement plot."""
-    actual = predictions_df["actual"].values.astype(float)
-    predicted = predictions_df["predicted"].values.astype(float)
-
-    mean_vals = (actual + predicted) / 2.0
-    diff_vals = predicted - actual
-    mean_diff = float(np.nanmean(diff_vals))
-    std_diff = float(np.nanstd(diff_vals, ddof=1))
-    loa_upper = mean_diff + 1.96 * std_diff
-    loa_lower = mean_diff - 1.96 * std_diff
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=mean_vals, y=diff_vals,
-        mode="markers",
-        name="Observations",
-        marker=dict(color="#8b5cf6", size=5, opacity=0.7),
-    ))
-    fig.add_hline(
-        y=mean_diff, line_color="#f59e0b", line_width=2,
-        annotation_text=f"Mean bias: {mean_diff:.3f}",
-        annotation_position="top right",
-    )
-    fig.add_hline(
-        y=loa_upper, line_color="#ef4444", line_dash="dash", line_width=1.5,
-        annotation_text=f"+1.96σ: {loa_upper:.3f}",
-        annotation_position="top right",
-    )
-    fig.add_hline(
-        y=loa_lower, line_color="#ef4444", line_dash="dash", line_width=1.5,
-        annotation_text=f"−1.96σ: {loa_lower:.3f}",
-        annotation_position="bottom right",
-    )
-
-    label = f" — {model_name}" if model_name else ""
-    fig.update_layout(
-        title=f"Bland-Altman Agreement Plot{label}",
-        xaxis_title="Mean of Actual & Predicted",
-        yaxis_title="Difference (Predicted − Actual)",
-        template="plotly_dark",
-    )
     return fig
 
 

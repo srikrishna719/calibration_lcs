@@ -119,7 +119,6 @@ Steps 10-12 appear in Advanced mode only.
 12. **README** — In-app editable notes *(Advanced)*
 13. **Export** — Calibrated CSV, model `.pkl`, metrics JSON, all-model metrics JSON, researcher PDF, config YAML/JSON, metadata JSON
 
-The Bland-Altman plot in `modules/plots.py` is not wired into the app.
 
 ## Calibration Metrics
 
