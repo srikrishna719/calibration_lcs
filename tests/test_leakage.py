@@ -14,13 +14,10 @@ import pytest
 from modules.leakage import (
     DEFAULT_R2_THRESHOLD,
     drop_target_encoding_columns,
+    find_reference_encoding_columns,
     find_target_encoding_columns,
 )
-from pipeline.run_pipeline import (
-    run_modeling_stage,
-    screen_target_encoding_columns,
-    train_on_prepared_dataset,
-)
+from pipeline.run_pipeline import run_modeling_stage, screen_leaking_columns
 
 TARGET, TIMESTAMP = "reference_pm25", "timestamp"
 
@@ -152,13 +149,13 @@ class TestGuards:
 
 class TestPipelineIntegration:
     def test_screening_runs_before_feature_engineering(self, leaky_frame, config):
-        cleaned, report = screen_target_encoding_columns(leaky_frame, TIMESTAMP, TARGET, config)
+        cleaned, report = screen_leaking_columns(leaky_frame, TIMESTAMP, TARGET, config)
         assert "pm25_sensor_minus_reference" not in cleaned.columns
         assert report.excluded
 
     def test_opt_in_keeps_them(self, leaky_frame, config):
         config["training"]["include_target_encoding_predictors"] = True
-        cleaned, report = screen_target_encoding_columns(leaky_frame, TIMESTAMP, TARGET, config)
+        cleaned, report = screen_leaking_columns(leaky_frame, TIMESTAMP, TARGET, config)
         assert "pm25_sensor_minus_reference" in cleaned.columns
         assert report.excluded == []
 
@@ -213,9 +210,39 @@ class TestOnRealData:
 
         out = run_modeling_stage(frame, config_factory(["ridge"]))
         features = out["training_results"]["ridge"].feature_names
-        assert "pm25_sensor_minus_reference" not in features
-        assert out["leakage_report"].excluded == ["pm25_sensor_minus_reference"]
+        excluded = out["leakage_report"].excluded
+
+        # The pm25 difference reconstructs the target; the temperature and
+        # humidity ones reconstruct a reference channel instead. Both kinds are
+        # undeployable, so none of them reach the model.
+        assert not any("minus_reference" in c for c in features)
+        assert "pm25_sensor_minus_reference" in excluded
+        assert "temperature_sensor_minus_reference" in excluded
+        assert "humidity_sensor_minus_reference" in excluded
         assert out["training_results"]["ridge"].metrics["r2"] < 0.99
+
+    def test_the_two_kinds_are_distinguished(self, real_single_device, config_factory):
+        """Only the pm25 difference is target leakage; the others hide reference readings."""
+        frame = real_single_device.copy()
+        numeric = [
+            c for c in frame.select_dtypes(include="number").columns
+            if frame[c].notna().mean() > 0.5
+        ]
+        frame = frame[[TIMESTAMP] + numeric].dropna().reset_index(drop=True)
+        frame[TIMESTAMP] = pd.to_datetime(frame[TIMESTAMP])
+
+        report = find_target_encoding_columns(frame, TARGET)
+        assert report.excluded == ["pm25_sensor_minus_reference"]
+
+        reference_columns = [c for c in numeric if c.startswith("reference_") and c != TARGET]
+        reference_report = find_reference_encoding_columns(
+            frame, reference_columns, [c for c in numeric if not c.startswith("reference_")]
+        )
+        assert "temperature_sensor_minus_reference" in reference_report.excluded
+        assert "humidity_sensor_minus_reference" in reference_report.excluded
+        assert "reference_temperature" in reference_report.reasons[
+            "temperature_sensor_minus_reference"
+        ]
 
     def test_only_the_target_matching_difference_column_is_leakage(self, real_single_device):
         """The other difference columns embed reference met data, which is a

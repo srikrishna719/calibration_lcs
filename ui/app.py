@@ -65,15 +65,13 @@ from modules.drift_analysis import (
     create_qq_plot,
     create_residual_histogram,
     create_residual_vs_predicted_figure,
-    generate_post_analysis_outputs,
 )
 from modules.download_helpers import render_chart_download, render_df_download
 from modules.data_loader import summarize_duplicate_timestamps
-from modules.leakage import find_target_encoding_columns
+from modules.leakage import find_reference_encoding_columns, find_target_encoding_columns
 from modules.normalization import get_normalization_summary, normalize_dataset
 from modules.diagnostics import COEFFICIENT_TABLE_COLUMNS, compute_vif, shapiro_wilk_test
 from modules.plots import (
-    create_bland_altman_plot,
     create_multi_model_metrics_bar,
     create_multi_model_scatter,
     create_multi_model_timeseries,
@@ -85,8 +83,6 @@ from pipeline.run_pipeline import (
     load_input_data,
     run_alignment_stage,
     run_eda_stage,
-    run_modeling_stage,
-    run_post_analysis_stage,
     run_preprocessing_stage,
     train_on_prepared_dataset,
 )
@@ -779,15 +775,30 @@ def cached_duplicate_summary(frame, timestamp_column):
 
 
 @st.cache_data(show_spinner=False)
-def cached_leakage_scan(merged_df, target_column):
-    """Pairwise target-encoding scan; cached because it is quadratic in columns."""
-    return find_target_encoding_columns(merged_df, target_column)
+def cached_leakage_scan(merged_df, target_column, reference_prefix="reference"):
+    """Pairwise leakage scan; cached because it is quadratic in columns.
 
+    Covers both columns that reconstruct the target and columns that hide a
+    reference reading (a sensor-minus-reference difference for some other
+    variable), which a deployed sensor could not supply.
+    """
+    numeric = [c for c in merged_df.select_dtypes(include="number").columns if c != target_column]
+    report = find_target_encoding_columns(merged_df, target_column, numeric)
 
-@st.cache_data(show_spinner=False)
-def cached_modeling(merged_df, cfg_text, feature_subset_json="null"):
-    subset = json.loads(feature_subset_json)
-    return run_modeling_stage(merged_df, json.loads(cfg_text), feature_subset=subset)
+    reference_columns = [
+        c for c in merged_df.select_dtypes(include="number").columns
+        if str(c).startswith(f"{reference_prefix}_") and c != target_column
+    ]
+    remaining = [c for c in numeric if c not in report.excluded]
+    if reference_columns and remaining:
+        extra = find_reference_encoding_columns(merged_df, reference_columns, remaining)
+        for name in extra.excluded:
+            if name.startswith(f"{reference_prefix}_") or name in report.reasons:
+                continue
+            report.excluded.append(name)
+            report.reasons[name] = extra.reasons[name]
+        report.exact_pairs.extend(extra.exact_pairs)
+    return report
 
 
 @st.cache_data(show_spinner=False)
@@ -1774,7 +1785,7 @@ def render_variable_selection():
     # difference, a residual, a renamed copy of the target. A model using one scores
     # near-perfectly and has learned nothing, and correlation does not reveal them,
     # so this is a pairwise fit against the chosen target.
-    leakage = cached_leakage_scan(merged, target)
+    leakage = cached_leakage_scan(merged, target, reference_prefix)
     leaking = [c for c in predictor_options if c in leakage.excluded]
     if leaking:
         st.error(

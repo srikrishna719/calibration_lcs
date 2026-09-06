@@ -84,6 +84,7 @@ def find_target_encoding_columns(
     r2_threshold: float = DEFAULT_R2_THRESHOLD,
     max_columns: int = DEFAULT_MAX_COLUMNS,
     min_rows: int = 10,
+    subject: str = "the target",
 ) -> LeakageReport:
     """Find predictors that reproduce ``target_column`` algebraically.
 
@@ -135,7 +136,7 @@ def find_target_encoding_columns(
             solo_flagged.append(column)
             report.solo.append((column, float(score)))
             report.reasons[column] = (
-                f"reproduces the target on its own (R2={score:.6f}); it is the target "
+                f"reproduces {subject} on its own (R2={score:.6f}); it is {subject} "
                 "under another name, not a predictor"
             )
     remaining = [c for c in usable if c not in solo_flagged]
@@ -173,8 +174,8 @@ def find_target_encoding_columns(
         victim = sorted(derived, key=lambda n: (-counts[n], n))[0]
         dropped.append(victim)
         report.reasons[victim] = (
-            f"combined with {', '.join(_partners(victim, outstanding))} it reconstructs the "
-            f"target exactly (R2={_best_score(victim, outstanding):.6f}); it carries the "
+            f"combined with {', '.join(_partners(victim, outstanding))} it reconstructs "
+            f"{subject} exactly (R2={_best_score(victim, outstanding):.6f}); it carries the "
             "reference value, so a model using it cannot be applied to a sensor on its own"
         )
         outstanding = [p for p in outstanding if victim not in (p[0], p[1])]
@@ -188,7 +189,7 @@ def find_target_encoding_columns(
             other = second if name is first else first
             dropped.append(name)
             report.reasons[name] = (
-                f"together with {other} it reconstructs the target exactly (R2={score:.6f}). "
+                f"together with {other} it reconstructs {subject} exactly (R2={score:.6f}). "
                 "Neither name identifies which is the derived column, so both are excluded; "
                 "re-enable the one you know is an independent measurement"
             )
@@ -208,3 +209,40 @@ def drop_target_encoding_columns(
     if not report.excluded:
         return dataframe, report
     return dataframe.drop(columns=report.excluded, errors="ignore"), report
+
+
+def find_reference_encoding_columns(
+    dataframe: pd.DataFrame,
+    reference_columns: Sequence[str],
+    candidates: Optional[Iterable[str]] = None,
+    **kwargs,
+) -> LeakageReport:
+    """Find predictors that carry reference-instrument readings.
+
+    A ``sensor_x - reference_x`` difference column is not target leakage when
+    the target is a different pollutant -- it does not reconstruct PM2.5 -- but
+    it still embeds a reading only the reference station has, so a model using
+    it cannot run on a deployed sensor. Detected by treating each reference
+    column as the thing to reconstruct, which finds these regardless of naming.
+    """
+    combined = LeakageReport()
+    pool = list(candidates) if candidates is not None else [
+        c for c in dataframe.select_dtypes(include="number").columns
+        if c not in set(reference_columns)
+    ]
+
+    for reference_column in reference_columns:
+        scoped = [c for c in pool if c != reference_column]
+        report = find_target_encoding_columns(
+            dataframe, reference_column, scoped, subject=f"'{reference_column}'", **kwargs
+        )
+        combined.scanned_columns = max(combined.scanned_columns, report.scanned_columns)
+        combined.skipped_reason = combined.skipped_reason or report.skipped_reason
+        combined.exact_pairs.extend(report.exact_pairs)
+        combined.solo.extend(report.solo)
+        for name in report.excluded:
+            if name not in combined.reasons:
+                combined.excluded.append(name)
+                combined.reasons[name] = report.reasons[name]
+
+    return combined

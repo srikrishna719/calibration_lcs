@@ -35,7 +35,11 @@ from modules.exporter import (
     export_project_run_json_bytes,
 )
 from modules.feature_engineering import append_time_features, engineer_sensor_features
-from modules.leakage import LeakageReport, find_target_encoding_columns
+from modules.leakage import (
+    LeakageReport,
+    find_reference_encoding_columns,
+    find_target_encoding_columns,
+)
 from modules.normalization import get_normalization_summary, normalize_dataset
 from modules.preprocessing import preprocess_dataset
 
@@ -205,31 +209,62 @@ def run_eda_stage(
 # Predictor selection
 # -----------------------------------------------------------------------
 
-def screen_target_encoding_columns(
+def screen_leaking_columns(
     dataframe: Any,
     timestamp_column: str,
     target_column: str,
     config: Dict[str, Any],
 ) -> tuple[Any, "LeakageReport"]:
-    """Drop predictors that reconstruct the target, before anything derives from them.
+    """Drop predictors that carry the target or a reference reading.
 
-    Runs on the merged frame rather than the engineered one: a leaking base
+    Two scans, both before anything derives from these columns: a leaking base
     column would otherwise spawn leaking lag, rolling and interaction columns,
-    and the pairwise scan does not scale to a wide engineered frame anyway. Set
-    ``training.include_target_encoding_predictors`` to keep them.
-    """
-    report = LeakageReport()
-    if bool(config.get("training", {}).get("include_target_encoding_predictors", False)):
-        return dataframe, report
+    and the pairwise scan does not scale to a wide engineered frame anyway.
 
-    candidates = [
+    The first finds columns reconstructing the target, which make the model
+    score perfectly while learning nothing
+    (``training.include_target_encoding_predictors`` keeps them). The second
+    finds columns reconstructing a reference channel -- a
+    ``sensor_x - reference_x`` difference for some other variable, which is not
+    target leakage but still needs a reading a deployed sensor does not have
+    (``training.include_reference_predictors`` keeps them, the same switch that
+    governs the reference columns themselves).
+    """
+    training_cfg = config.get("training", {})
+    data_cfg = config.get("data", {})
+    reference_prefix = str(data_cfg.get("reference_prefix", "reference"))
+
+    numeric = [
         c for c in dataframe.select_dtypes(include="number").columns
         if c not in (timestamp_column, target_column)
     ]
-    report = find_target_encoding_columns(dataframe, target_column, candidates)
-    if not report.excluded:
-        return dataframe, report
-    return dataframe.drop(columns=report.excluded, errors="ignore"), report
+    combined = LeakageReport()
+
+    if not bool(training_cfg.get("include_target_encoding_predictors", False)):
+        combined = find_target_encoding_columns(dataframe, target_column, numeric)
+
+    if not bool(training_cfg.get("include_reference_predictors", False)):
+        reference_columns = [
+            c for c in dataframe.select_dtypes(include="number").columns
+            if str(c).startswith(f"{reference_prefix}_") and c != target_column
+        ]
+        remaining = [c for c in numeric if c not in combined.excluded]
+        if reference_columns and remaining:
+            reference_report = find_reference_encoding_columns(
+                dataframe, reference_columns, remaining
+            )
+            for name in reference_report.excluded:
+                # Reference channels are dropped later by deployable_feature_subset;
+                # what matters here is the derived columns that hide them.
+                if name.startswith(f"{reference_prefix}_") or name in combined.reasons:
+                    continue
+                combined.excluded.append(name)
+                combined.reasons[name] = reference_report.reasons[name]
+            combined.exact_pairs.extend(reference_report.exact_pairs)
+
+    if not combined.excluded:
+        return dataframe, combined
+    return dataframe.drop(columns=combined.excluded, errors="ignore"), combined
 
 
 def deployable_feature_subset(
@@ -283,7 +318,7 @@ def run_modeling_stage(
     ts_col = str(data_cfg["timestamp_column"])
     target_col = f"{data_cfg['reference_prefix']}_{data_cfg['target_column']}"
 
-    merged_df, leakage_report = screen_target_encoding_columns(
+    merged_df, leakage_report = screen_leaking_columns(
         merged_df, ts_col, target_col, config
     )
 
@@ -577,7 +612,15 @@ def run_full_pipeline(
     modeling = run_modeling_stage(alignment["merged_data"], config)
 
     best_result = modeling["training_results"][modeling["best_model_name"]]
-    post = run_post_analysis_stage(best_result.full_predictions, config)
+    # Drift is a question about held-out behaviour. full_predictions come from
+    # the final model refit on every row, so rolling error computed on them
+    # understates drift everywhere.
+    post = run_post_analysis_stage(
+        best_result.validation_predictions
+        if best_result.validation_predictions is not None
+        else best_result.full_predictions,
+        config,
+    )
 
     export = build_export_bundle(
         calibrated_dataset=modeling["calibrated_dataset"],

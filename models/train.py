@@ -213,6 +213,7 @@ class TrainingResult:
     coefficient_table: Optional[pd.DataFrame] = None
     validation_method: str = "timeseriessplit"
     validation_predictions: Optional[pd.DataFrame] = None
+    # predicted - actual, the convention used throughout evaluation and plots.
     residuals: Optional[pd.Series] = None
     # Parameters chosen inside each outer fold when tuning ran under nested CV.
     # ``best_params`` is the final search over all rows; these show its stability.
@@ -692,9 +693,13 @@ def train_models(
                     coefficient_table["p-value"].astype(float),
                 ))
 
+        # predicted - actual, matching evaluation.metrics.bias, the drift
+        # analysis and every residual plot. The opposite convention here made
+        # TrainingResult.residuals disagree in sign with everything that
+        # consumed it.
         residuals = pd.Series(
-            np.asarray(validation_pred_df["actual"], dtype=float)
-            - np.asarray(validation_pred_df["predicted"], dtype=float)
+            np.asarray(validation_pred_df["predicted"], dtype=float)
+            - np.asarray(validation_pred_df["actual"], dtype=float)
         )
 
         results.append(TrainingResult(

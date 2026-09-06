@@ -6,7 +6,7 @@ for diagnosing model performance degradation over time.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
