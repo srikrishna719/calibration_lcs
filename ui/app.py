@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import io
 import sys
+import traceback
 from pathlib import Path
 from string import Template
 from typing import Any, Dict, List, Optional
@@ -68,6 +69,7 @@ from modules.drift_analysis import (
 )
 from modules.download_helpers import render_chart_download, render_df_download
 from config.validation import load_config_text
+from evaluation.metrics import MAPE_MIN_DENOMINATOR
 from modules.data_loader import summarize_duplicate_timestamps
 from modules.leakage import find_reference_encoding_columns, find_target_encoding_columns
 from modules.normalization import get_normalization_summary, normalize_dataset
@@ -653,6 +655,43 @@ def _prediction_scope_caption(scope: str) -> str:
     return "Showing full fitted predictions from the final model refit on all available modelling rows."
 
 
+def _render_outlier_breakdown(label: str, summary) -> None:
+    """Explain a surprising outlier count by showing each column's contribution.
+
+    A row is dropped when any screened column objects, so with several columns
+    the total is much larger than any single one -- on independent columns the
+    survival rates multiply. Without the breakdown that total looks like a data
+    quality problem rather than an artefact of screening breadth.
+    """
+    by_column = getattr(summary, "outlier_rows_by_column", None) or {}
+    removed = getattr(summary, "rows_removed_as_outliers", 0)
+    if not by_column or not removed:
+        return
+
+    screened = getattr(summary, "outlier_columns", []) or []
+    largest = max(by_column.values())
+    share = removed / summary.original_rows if summary.original_rows else 0.0
+
+    with st.expander(
+        f"Outlier removal breakdown — {label} ({removed} rows, {share:.0%})",
+        expanded=share >= 0.10,
+    ):
+        if len(screened) > 1 and removed > largest:
+            st.caption(
+                f"{len(screened)} columns are screened and a row is dropped if any one of "
+                f"them flags it. The worst single column accounts for {largest} rows, but "
+                f"the union removes {removed}. Narrow the screen with "
+                "`preprocessing.outlier_columns` if that is more than you intended."
+            )
+        st.dataframe(
+            pd.DataFrame(
+                {"column": list(by_column), "rows it would remove alone": list(by_column.values())}
+            ),
+            width='stretch',
+            hide_index=True,
+        )
+
+
 def _normalization_summary_tables(summary: pd.DataFrame):
     """Split normalization summary into before/after display tables."""
     before_cols = [c for c in summary.columns if c.startswith("before_") or c == "column"]
@@ -677,6 +716,21 @@ def _parse_positive_int_list(text: str) -> list:
 
 def is_advanced_mode() -> bool:
     return st.session_state.get("app_mode", "Basic") == "Advanced"
+
+
+def report_error(exc: Exception) -> None:
+    """Show a failure, with the traceback available in Advanced mode.
+
+    Every step used to render only str(exc). That is fine for the errors this
+    app raises deliberately, but for anything unexpected it reduced the whole
+    diagnosis to a single word -- a bare KeyError showed as just the key name.
+    """
+    st.error(f"❌ {exc}")
+    if is_advanced_mode():
+        with st.expander("Technical details", expanded=False):
+            st.code("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+    else:
+        st.caption("Switch to Advanced mode in the sidebar to see the full traceback.")
 
 
 def _uploaded_csv_columns(uploaded_file) -> list[str]:
@@ -1080,7 +1134,7 @@ def render_upload():
                 st.session_state.current_step = STEPS[8]
                 st.rerun()
             except Exception as e:
-                st.error(f"❌ {e}")
+                report_error(e)
 
     # Preview
     with st.expander("👀 Preview bundled sample datasets"):
@@ -1273,7 +1327,7 @@ def render_upload():
             _reset_downstream(*_DOWNSTREAM_FROM_UPLOAD)
             st.success(f"✅ Data loaded successfully from **{label}**")
         except Exception as e:
-            st.error(f"❌ {e}")
+            report_error(e)
 
     if st.session_state.data_outputs is not None:
         pills = (
@@ -1448,7 +1502,7 @@ def render_preprocessing():
                 _reset_downstream(*_DOWNSTREAM_FROM_PREPROCESSING)
                 st.success("✅ Preprocessing completed")
             except Exception as e:
-                st.error(f"❌ {e}")
+                report_error(e)
 
     out = st.session_state.preprocessing_outputs
     if out is not None:
@@ -1471,6 +1525,9 @@ def render_preprocessing():
                 + info_pill(f"Outliers removed: {sen_s.rows_removed_as_outliers}"),
                 unsafe_allow_html=True,
             )
+
+        _render_outlier_breakdown("Reference", ref_s)
+        _render_outlier_breakdown("LCS (Sensor)", sen_s)
 
         tab1, tab2 = st.tabs(["Reference (cleaned)", "Sensor (cleaned)"])
         with tab1:
@@ -1576,7 +1633,7 @@ def render_alignment():
                 _reset_downstream(*_DOWNSTREAM_FROM_ALIGNMENT)
                 st.success("✅ Alignment completed")
             except Exception as e:
-                st.error(f"❌ {e}")
+                report_error(e)
 
     out = st.session_state.alignment_outputs
     if out is not None:
@@ -1630,7 +1687,7 @@ def render_eda():
                 st.session_state.eda_outputs = outputs
                 st.success("✅ EDA generated")
             except Exception as e:
-                st.error(f"❌ {e}")
+                report_error(e)
 
     out = st.session_state.eda_outputs
     if out is not None:
@@ -2025,12 +2082,13 @@ def render_feature_engineering():
                     timestamp_column=ts_col,
                     target_column=target_col,
                     config=fe_config,
+                    sensor_prefix=str(config["data"].get("sensor_prefix", "sensor")),
                 )
                 st.session_state.feature_engineering_outputs = {"featured_dataset": featured}
                 st.session_state.featured_preview = featured
                 st.success(f"\u2705 Sensor-derived features prepared: {len(featured.columns) - 2} features, {len(featured)} rows")
             except Exception as e:
-                st.error(f"\u274c {e}")
+                report_error(e)
 
     fe_out = st.session_state.feature_engineering_outputs
     if fe_out is not None:
@@ -2117,7 +2175,7 @@ def render_normalization():
                 }
                 st.success(f"\u2705 Normalization applied: {method_label}")
             except Exception as e:
-                st.error(f"\u274c {e}")
+                report_error(e)
 
     norm_out = st.session_state.normalization_outputs
     if norm_out is not None:
@@ -2623,7 +2681,7 @@ def render_modelling():
                 _record_run_history("Manual training")
                 st.success("✅ All models trained successfully!")
             except Exception as e:
-                st.error(f"❌ {e}")
+                report_error(e)
 
     out = st.session_state.modeling_outputs
     if out is not None:
@@ -2726,6 +2784,13 @@ def render_results():
                 "predictions are available for visual inspection, but they are not used for ranking."
             )
         render_metric_row(result.metrics, ["rmse", "mae", "r2", "mape"], ["RMSE", "MAE", "R²", "MAPE"])
+        excluded = result.metrics.get("mape_excluded_fraction")
+        if isinstance(excluded, float) and excluded > 0:
+            st.caption(
+                f"MAPE ignores the {excluded:.0%} of observations with a reference value below "
+                f"{MAPE_MIN_DENOMINATOR:g}, where a percentage reflects the near-zero denominator "
+                "rather than the model. Judge low-concentration performance by RMSE or MAE."
+            )
         st.markdown("")
         render_metric_row(result.metrics, ["bias", "pearson_r", "slope", "intercept"],
                           ["Bias", "Pearson r", "Slope", "Intercept"])
@@ -3072,7 +3137,7 @@ def render_export():
                     coefficient_table=getattr(result, "coefficient_table", None),
                     selected_target=st.session_state.selected_target,
                     selected_predictors=st.session_state.selected_predictors,
-                    modelling_objective=config.get("modelling", {}).get("objective"),
+                    modelling_objective=config.get("training", {}).get("modelling_objective"),
                     leaderboard=out["leaderboard"],
                     training_results=out["training_results"],
                     prepared_dataset=out["featured_data"],
@@ -3080,7 +3145,7 @@ def render_export():
                 st.session_state.export_bundle = bundle
                 st.success("✅ Export bundle ready!")
             except Exception as e:
-                st.error(f"❌ {e}")
+                report_error(e)
 
     bundle = st.session_state.export_bundle
     if bundle is not None:

@@ -73,6 +73,7 @@ def build_sample_demo_state(
         timestamp_column=ts_col,
         target_column=target_col,
         config=feature_config,
+        sensor_prefix=str(config.get("data", {}).get("sensor_prefix", "sensor")),
     )
 
     norm_method = str(config.get("normalization", {}).get("method", "none")).strip().lower()

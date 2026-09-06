@@ -82,6 +82,31 @@ def _merge_defaults(base: Mapping[str, Any], overrides: Mapping[str, Any]) -> Di
     return merged
 
 
+# Older configs carried these alongside the training equivalents, leaving two
+# places to look and no rule for which won. They are folded into training.* on
+# load, so nothing downstream has to know about them.
+LEGACY_KEYS = {
+    ("validation", "method"): "validation_method",
+    ("modelling", "objective"): "modelling_objective",
+}
+
+
+def _migrate_legacy_sections(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Fold the retired top-level blocks into ``training`` and drop them."""
+    training = config.setdefault("training", {})
+    for (section, key), training_key in LEGACY_KEYS.items():
+        block = config.get(section)
+        if not isinstance(block, Mapping):
+            continue
+        value = block.get(key)
+        # An explicit training value wins; the legacy block only fills a gap.
+        if value is not None and training.get(training_key) is None:
+            training[training_key] = value
+    for section, _ in LEGACY_KEYS:
+        config.pop(section, None)
+    return config
+
+
 def unknown_sections(config: Mapping[str, Any]) -> List[str]:
     """Top-level keys the pipeline does not read -- usually a typo."""
     known = set(load_default_config().keys()) | {"validation", "modelling"}
@@ -123,7 +148,12 @@ def validate_config(config: Any, source: str = "configuration") -> Dict[str, Any
                 f"got {type(config[section]).__name__}."
             )
 
-    merged = _merge_defaults(load_default_config(), config)
+    # Migrate before merging: defaults would otherwise fill training.* first and
+    # the legacy block would never get a chance to supply the value.
+    migrated = _migrate_legacy_sections(deepcopy(dict(config)))
+    merged = _merge_defaults(load_default_config(), migrated)
+    merged.pop("validation", None)
+    merged.pop("modelling", None)
 
     data = merged["data"]
     for key in REQUIRED_DATA_KEYS:

@@ -390,6 +390,7 @@ def run_modeling_stage(
         timestamp_column=ts_col,
         target_column=target_col,
         config=config["feature_engineering"],
+        sensor_prefix=str(data_cfg.get("sensor_prefix", "sensor")),
     )
     if featured_df.empty:
         raise ValueError(

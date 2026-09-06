@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+import argparse
 from xml.sax.saxutils import escape
 import math
 import zipfile
@@ -344,7 +345,52 @@ def write_xlsx(path: Path, sheets: dict[str, pd.DataFrame]) -> None:
             archive.writestr(f"xl/worksheets/sheet{idx}.xml", sheet_xml(dataframe))
 
 
+def _require_inputs() -> None:
+    """Fail with the missing filenames rather than a bare FileNotFoundError.
+
+    These inputs live under a gitignored data/ directory, so anyone but the
+    original author starts without them. Say which files are expected and
+    where, instead of dying on whichever one pandas reached first.
+    """
+    expected = [MASTER_FILE, *SENSOR_FILES]
+    missing = [path for path in expected if not path.exists()]
+    if not missing:
+        return
+
+    lines = [
+        "This script builds the 2025 co-location dataset from raw exports that are",
+        "not in the repository (data/ is gitignored).",
+        f"Expected under {DATA_DIR}:",
+        *[f"  - {path.name}" for path in expected],
+        "Missing:",
+        *[f"  - {path.name}" for path in missing],
+        "Pass --data-dir to point at another location.",
+    ]
+    raise SystemExit("\n".join(lines))
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--data-dir", type=Path, default=DATA_DIR,
+        help="Directory holding the raw reference and sensor exports.",
+    )
+    parser.add_argument(
+        "--output-dir", type=Path, default=OUTPUT_DIR,
+        help="Directory to write the merged dataset into.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    global DATA_DIR, OUTPUT_DIR, MASTER_FILE, SENSOR_FILES
+    args = _parse_args()
+    if args.data_dir != DATA_DIR:
+        DATA_DIR = args.data_dir
+        MASTER_FILE = DATA_DIR / MASTER_FILE.name
+        SENSOR_FILES = [DATA_DIR / path.name for path in SENSOR_FILES]
+    OUTPUT_DIR = args.output_dir
+    _require_inputs()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     reference = load_reference_2025()
     sensor = load_sensor_2025()

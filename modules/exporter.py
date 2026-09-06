@@ -53,9 +53,36 @@ def _nested_config_value(config: Dict[str, Any], path: tuple[str, ...], default:
     return current
 
 
+# fpdf2's built-in fonts are Latin-1 only. Rather than let every unsupported
+# character collapse to "?", map the ones that actually turn up in air quality
+# work -- units, dashes, quotes -- to a readable Latin-1 equivalent first.
+_PDF_TRANSLITERATIONS = {
+    "–": "-", "—": "-", "−": "-",          # dashes and minus
+    "‘": "'", "’": "'", "“": '"', "”": '"',
+    "…": "...", "•": "-", " ": " ",
+    "₀": "0", "₁": "1", "₂": "2", "₃": "3",  # subscripts
+    "₄": "4", "₅": "5", "₆": "6", "₇": "7",
+    "₈": "8", "₉": "9",
+    "⁰": "0", "¹": "1",                          # superscripts not in latin-1
+    "⁴": "4", "⁵": "5", "⁶": "6", "⁷": "7",
+    "⁸": "8", "⁹": "9",
+    "μ": "µ", "Å": "A",                     # greek mu -> micro sign
+    "≤": "<=", "≥": ">=", "≠": "!=", "×": "x",
+}
+
+
 def _pdf_safe_text(value: Any, limit: Optional[int] = None) -> str:
-    """Return text safe for the built-in PDF fonts."""
+    """Return text safe for the built-in PDF fonts.
+
+    Characters outside Latin-1 cannot be drawn by fpdf2's core fonts. Common
+    typography and scientific notation are transliterated so a report keeps its
+    meaning; anything genuinely unrepresentable still becomes "?", which is a
+    font limitation rather than something this function can fix.
+    """
     text = str(value)
+    for source, replacement in _PDF_TRANSLITERATIONS.items():
+        if source in text:
+            text = text.replace(source, replacement)
     if limit is not None:
         text = text[:limit]
     return text.encode("latin-1", errors="replace").decode("latin-1")
@@ -320,13 +347,13 @@ def export_project_run_json(
         if modelling_objective is not None
         else _nested_config_value(
             config,
-            ("modelling", "objective"),
+            ("training", "modelling_objective"),
             _nested_config_value(config, ("training", "modelling_objective")),
         )
     )
     validation_method = _nested_config_value(
         config,
-        ("validation", "method"),
+        ("training", "validation_method"),
         _nested_config_value(config, ("training", "validation_method"), "timeseriessplit"),
     )
 
@@ -443,7 +470,7 @@ def export_research_report_pdf(
             ("Prepared columns", cols),
             ("Time span start", time_start),
             ("Time span end", time_end),
-            ("Objective", modelling_objective or _nested_config_value(config, ("modelling", "objective"), train_cfg.get("modelling_objective"))),
+            ("Objective", modelling_objective or train_cfg.get("modelling_objective")),
         ],
     )
 
@@ -488,7 +515,7 @@ def export_research_report_pdf(
         pdf,
         [
             ("Selected models", train_cfg.get("selected_models", [])),
-            ("Validation method", train_cfg.get("validation_method", _nested_config_value(config, ("validation", "method")))),
+            ("Validation method", train_cfg.get("validation_method")),
             ("Test split size", train_cfg.get("test_size")),
             ("Cross-validation folds", train_cfg.get("cross_validation_folds")),
             ("Random state", _nested_config_value(config, ("app", "random_state"))),
@@ -697,8 +724,8 @@ def export_model_summary_report_pdf(
         ("Test Size", config.get("training", {}).get("test_size")),
         ("CV Folds", config.get("training", {}).get("cross_validation_folds")),
         ("Normalization", config.get("normalization", {}).get("method", "none")),
-        ("Validation", _nested_config_value(config, ("validation", "method"), config.get("training", {}).get("validation_method"))),
-        ("Objective", _nested_config_value(config, ("modelling", "objective"), config.get("training", {}).get("modelling_objective"))),
+        ("Validation", config.get("training", {}).get("validation_method")),
+        ("Objective", config.get("training", {}).get("modelling_objective")),
     ]
     for label, val in config_items:
         pdf.cell(0, 5, _pdf_safe_text(f"  {label}: {val}"), new_x="LMARGIN", new_y="NEXT")

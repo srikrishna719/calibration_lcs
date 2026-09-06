@@ -20,17 +20,28 @@ def select_feature_columns(
     dataframe: pd.DataFrame,
     target_column: str,
     config: Dict[str, object],
+    sensor_prefix: str = "sensor",
 ) -> List[str]:
-    """Select numeric feature columns, including optional meteorological variables."""
+    """Select numeric feature columns, including optional meteorological variables.
+
+    When ``optional_columns`` is set it narrows the pool to those columns plus
+    the sensor channels. ``sensor_prefix`` must match ``data.sensor_prefix``;
+    this used to be the hardcoded substring ``"sensor_"``, so renaming the
+    prefix silently emptied the feature set.
+    """
     numeric_columns = dataframe.select_dtypes(include=[np.number]).columns.tolist()
     feature_columns = [col for col in numeric_columns if col != target_column]
 
     optional_columns = [str(col) for col in config.get("optional_columns", [])]
     if optional_columns:
-        feature_columns = [
+        prefix = f"{str(sensor_prefix).rstrip('_')}_"
+        narrowed = [
             col for col in feature_columns
-            if col in optional_columns or "sensor_" in col
+            if col in optional_columns or str(col).startswith(prefix)
         ]
+        # Narrowing to nothing means the prefix or the list does not match this
+        # dataset; using every feature beats engineering none of them.
+        feature_columns = narrowed or feature_columns
 
     return feature_columns
 
@@ -302,6 +313,7 @@ def engineer_sensor_features(
     timestamp_column: str,
     target_column: str,
     config: Dict[str, object],
+    sensor_prefix: str = "sensor",
 ) -> pd.DataFrame:
     """Apply sensor-derived features, excluding timestamp-derived features."""
     if not bool(config.get("enabled", True)):
@@ -311,6 +323,7 @@ def engineer_sensor_features(
         dataframe=dataframe,
         target_column=target_column,
         config=config,
+        sensor_prefix=sensor_prefix,
     )
 
     engineered = create_lag_features(

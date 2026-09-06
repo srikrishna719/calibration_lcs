@@ -21,6 +21,10 @@ preprocessing:
   missing_strategy: linear_interpolation_forward_fill
   outlier_method: iqr
   outlier_threshold: 1.5
+  # A row is dropped when ANY screened column calls it an outlier, so the loss
+  # compounds with column count even on clean data (~11% of rows across 16
+  # independent gaussian columns). Name columns here to screen only those.
+  outlier_columns: []
   reference:
     missing_strategy: linear_interpolation_forward_fill
     outlier_method: none
@@ -50,12 +54,6 @@ feature_engineering:
 
 normalization:
   method: none
-
-validation:
-  method: timeseriessplit
-
-modelling:
-  objective: null
 
 training:
   test_size: 0.2

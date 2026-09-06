@@ -49,6 +49,8 @@ def create_leaderboard(
         rows.append(row)
 
     leaderboard = pd.DataFrame(rows)
+    # A diagnostic about MAPE's coverage, not a score to rank models by.
+    leaderboard = leaderboard.drop(columns=["mape_excluded_fraction"], errors="ignore")
     if leaderboard.empty:
         raise ValueError("No model training results were available for comparison.")
 
