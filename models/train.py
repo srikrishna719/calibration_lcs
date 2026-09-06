@@ -214,6 +214,9 @@ class TrainingResult:
     validation_method: str = "timeseriessplit"
     validation_predictions: Optional[pd.DataFrame] = None
     residuals: Optional[pd.Series] = None
+    # Parameters chosen inside each outer fold when tuning ran under nested CV.
+    # ``best_params`` is the final search over all rows; these show its stability.
+    nested_best_params: Optional[List[Dict[str, Any]]] = None
     # Scaler composed into ``model``; "none" when the model takes raw features.
     normalization_method: str = "none"
 
@@ -462,14 +465,50 @@ def generate_validation_predictions(
     folds: int,
     method: str,
     random_state: int,
-) -> pd.DataFrame:
-    """Generate out-of-fold predictions using the requested validation strategy."""
+    tuning: Optional[Dict[str, Any]] = None,
+) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
+    """Generate out-of-fold predictions using the requested validation strategy.
+
+    Parameters
+    ----------
+    tuning:
+        When given (``{"model_name": ..., "n_iter": ...}``), hyperparameters are
+        searched *within each outer training fold* rather than once beforehand.
+        This nesting is what keeps the returned predictions honest: the
+        parameters used to predict a fold were chosen without ever seeing it. A
+        single search up front would select parameters using rows that later
+        appear in the folds being scored, quietly flattering every metric.
+
+    Returns
+    -------
+    Tuple[pd.DataFrame, List[Dict[str, Any]]]
+        Out-of-fold predictions, and the parameters chosen per fold (empty when
+        no tuning was requested). Divergent per-fold parameters are a useful
+        signal that the search is unstable on this dataset.
+    """
     splitter = _make_cv_splitter(method, len(features), folds, random_state)
     predictions: List[pd.DataFrame] = []
+    fold_params: List[Dict[str, Any]] = []
 
     for train_idx, test_idx in splitter.split(features):
         fold_model = _clone_model(model)
-        fold_model.fit(features.iloc[train_idx], target.iloc[train_idx])
+        x_fold, y_fold = features.iloc[train_idx], target.iloc[train_idx]
+
+        if tuning:
+            fold_model, chosen = tune_hyperparameters(
+                model_name=str(tuning["model_name"]),
+                model=fold_model,
+                x_train=x_fold,
+                y_train=y_fold,
+                n_iter=int(tuning["n_iter"]),
+                cv_folds=folds,
+                random_state=random_state,
+                validation_method=method,
+            )
+            fold_params.append(chosen)
+        else:
+            fold_model.fit(x_fold, y_fold)
+
         fold_preds = fold_model.predict(features.iloc[test_idx])
         predictions.append(pd.DataFrame({
             "timestamp": timestamps.iloc[test_idx].values,
@@ -478,9 +517,10 @@ def generate_validation_predictions(
         }))
 
     if not predictions:
-        return pd.DataFrame(columns=["timestamp", "actual", "predicted"])
+        return pd.DataFrame(columns=["timestamp", "actual", "predicted"]), fold_params
 
-    return pd.concat(predictions, ignore_index=True).sort_values("timestamp").reset_index(drop=True)
+    combined = pd.concat(predictions, ignore_index=True).sort_values("timestamp").reset_index(drop=True)
+    return combined, fold_params
 
 
 
@@ -551,24 +591,32 @@ def train_models(
         # Scaling travels with the estimator: fit per fold, exported with the model.
         model = build_estimator(model, normalization_method)
 
-        # --- optional tuning ---
+        # --- tuning configuration ---
         model_tune = tuning_cfg.get(model_name, {})
-        if model_tune.get("enabled", False) and model_name not in STATSMODELS_LINEAR_MODELS:
-            n_iter = int(model_tune.get("n_iter", 10))
-            model, best_params = tune_hyperparameters(
-                model_name=model_name,
-                model=model,
-                x_train=x_train,
-                y_train=y_train,
-                n_iter=n_iter,
-                cv_folds=folds,
-                random_state=random_state,
-                validation_method=validation_method,
-            )
+        tune_enabled = (
+            bool(model_tune.get("enabled", False))
+            and model_name not in STATSMODELS_LINEAR_MODELS
+        )
+        n_iter = int(model_tune.get("n_iter", 10))
+        nested_best_params: List[Dict[str, Any]] = []
 
         # --- validation predictions and metrics ---
         if validation_method == "holdout":
-            model.fit(x_train, y_train)
+            # The search only ever sees the chronological training split, and
+            # metrics come from the held-out tail, so one search is enough here.
+            if tune_enabled:
+                model, best_params = tune_hyperparameters(
+                    model_name=model_name,
+                    model=model,
+                    x_train=x_train,
+                    y_train=y_train,
+                    n_iter=n_iter,
+                    cv_folds=folds,
+                    random_state=random_state,
+                    validation_method=validation_method,
+                )
+            else:
+                model.fit(x_train, y_train)
             test_preds = model.predict(x_test)
             validation_pred_df = pd.DataFrame({
                 "timestamp": ts_test.values,
@@ -580,7 +628,10 @@ def train_models(
                 y_pred=pd.Series(test_preds, index=y_test.index),
             )
         else:
-            validation_pred_df = generate_validation_predictions(
+            # Metrics come from every row, so tuning has to happen inside each
+            # fold. Searching once beforehand would pick parameters using rows
+            # that are later scored as validation data.
+            validation_pred_df, nested_best_params = generate_validation_predictions(
                 model=model,
                 features=features,
                 target=target,
@@ -588,12 +639,28 @@ def train_models(
                 folds=folds,
                 method=validation_method,
                 random_state=random_state,
+                tuning={"model_name": model_name, "n_iter": n_iter} if tune_enabled else None,
             )
             metrics = calculate_regression_metrics(
                 y_true=validation_pred_df["actual"],
                 y_pred=validation_pred_df["predicted"],
             )
-            model.fit(features, target)
+            # The exported model is tuned and fitted on everything. The metrics
+            # above were produced by the nested procedure, so this final search
+            # cannot feed back into them.
+            if tune_enabled:
+                model, best_params = tune_hyperparameters(
+                    model_name=model_name,
+                    model=model,
+                    x_train=features,
+                    y_train=target,
+                    n_iter=n_iter,
+                    cv_folds=folds,
+                    random_state=random_state,
+                    validation_method=validation_method,
+                )
+            else:
+                model.fit(features, target)
 
         metrics["validation_method"] = validation_method
 
@@ -649,6 +716,7 @@ def train_models(
             validation_predictions=validation_pred_df.reset_index(drop=True),
             residuals=residuals,
             normalization_method=normalization_method,
+            nested_best_params=nested_best_params or None,
         ))
 
     return results

@@ -2336,6 +2336,14 @@ def render_modelling():
             "💡 More iterations (n_iter) = broader search = better results, but slower. "
             "Start with 10–20. Increase to 50–100 for a thorough search on final runs."
         )
+        st.warning(
+            "With K-Fold or TimeSeriesSplit, the search runs **inside every validation fold** "
+            "(nested cross-validation) so the reported metrics stay honest. That costs roughly "
+            "one extra search per fold, so training takes noticeably longer than an untuned run. "
+            "Expect the tuned metrics to shift compared with earlier versions of this app — in "
+            "either direction — because they now measure parameters that never saw the fold "
+            "being scored."
+        )
         tuning_cfg = config["training"].get("tuning", {})
         for mname in ["random_forest", "xgboost", "ridge", "lasso"]:
             c1t, c2t = st.columns([2, 1])
@@ -2416,9 +2424,32 @@ def render_modelling():
         tuned = {n: r for n, r in out["training_results"].items() if r.best_params}
         if tuned:
             with st.expander("🔧 Best Hyperparameters Found", expanded=False):
+                st.caption(
+                    "Parameters below come from a final search over all rows and are what "
+                    "the exported model uses. The leaderboard metrics come from a separate "
+                    "nested search run inside each validation fold, so they do not reflect "
+                    "these particular values."
+                )
                 for mname, res in tuned.items():
                     st.markdown(f"**{mname}**")
                     st.json(res.best_params)
+                    per_fold = getattr(res, "nested_best_params", None)
+                    if per_fold:
+                        keys = sorted({k for fold in per_fold for k in fold})
+                        fold_table = pd.DataFrame(
+                            [{"fold": i + 1, **{k: fold.get(k) for k in keys}}
+                             for i, fold in enumerate(per_fold)]
+                        )
+                        unstable = [k for k in keys if len({str(f.get(k)) for f in per_fold}) > 1]
+                        st.caption(
+                            "Parameters chosen inside each validation fold. "
+                            + (f"Varies across folds: {', '.join(unstable)} — the search is "
+                               "unstable on this dataset, so treat the values above as one draw "
+                               "rather than a settled answer."
+                               if unstable else
+                               "Identical across all folds, which suggests a stable search.")
+                        )
+                        st.dataframe(fold_table, width='stretch')
 
     st.markdown("---")
     if st.button("Next ➡️", key="next_modeling_always", width='stretch', disabled=(out is None),
