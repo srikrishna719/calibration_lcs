@@ -14,7 +14,7 @@ import pandas as pd
 import pytest
 
 from modules.alignment import non_numeric_columns, resample_timeseries
-from modules.data_loader import load_and_validate_dataset
+from modules.data_loader import load_and_validate_dataset, summarize_duplicate_timestamps
 from models.train import fitted_scaler
 from pipeline.run_pipeline import deployable_feature_subset, train_on_prepared_dataset
 
@@ -66,17 +66,44 @@ class TestShapeOfRealData:
         assert empty, "expected some instrument channels to carry no data"
         assert "sensor_co2" in empty
 
-    def test_duplicate_timestamps_across_devices_are_collapsed_by_the_loader(self, real_merged_raw):
-        """Characterises current behaviour, which silently discards most rows.
+    def test_loading_the_whole_file_refuses_rather_than_interleaving_devices(self, real_merged_raw):
+        """Six co-located devices share the hourly grid.
 
-        Six co-located devices report on the same hourly grid. The loader keeps
-        one row per timestamp, so a whole-file load drops ~80% of the data and
-        interleaves devices. Load one device at a time instead.
+        Keeping one row per timestamp would drop ~80% of the file and mix the
+        devices into a single incoherent series, so the loader refuses and says
+        which column separates them.
         """
-        loaded = load_and_validate_dataset(real_merged_raw, TIMESTAMP, "Merged", "UTC")
         assert real_merged_raw[TIMESTAMP].duplicated().sum() > 0
-        assert len(loaded) < 0.5 * len(real_merged_raw)
+        with pytest.raises(ValueError, match="repeat a timestamp"):
+            load_and_validate_dataset(real_merged_raw, TIMESTAMP, "Merged", "UTC")
+
+    def test_the_device_column_is_identified_automatically(self, real_merged_raw):
+        summary = summarize_duplicate_timestamps(real_merged_raw, TIMESTAMP)
+        assert "sensor_device_id" in summary.candidate_group_columns
+
+    def test_selecting_a_device_keeps_every_one_of_its_rows(self, real_merged_raw):
+        device = real_merged_raw["sensor_device_id"].value_counts().idxmax()
+        expected = int((real_merged_raw["sensor_device_id"] == device).sum())
+
+        loaded, summary = load_and_validate_dataset(
+            real_merged_raw, TIMESTAMP, "Merged", "UTC",
+            duplicate_strategy="first",
+            group_column="sensor_device_id", group_value=device,
+            return_summary=True,
+        )
+        assert len(loaded) == expected
         assert loaded[TIMESTAMP].duplicated().sum() == 0
+        assert (loaded["sensor_device_id"] == device).all()
+        assert f"Kept only sensor_device_id='{device}'" in summary.message()
+
+    def test_averaging_devices_covers_the_whole_grid(self, real_merged_raw):
+        loaded, summary = load_and_validate_dataset(
+            real_merged_raw, TIMESTAMP, "Merged", "UTC",
+            duplicate_strategy="mean", return_summary=True,
+        )
+        assert len(loaded) == real_merged_raw[TIMESTAMP].nunique()
+        assert loaded[TIMESTAMP].duplicated().sum() == 0
+        assert "combined with the mean" in summary.message()
 
     def test_a_single_device_loads_without_loss(self, real_single_device):
         loaded = load_and_validate_dataset(real_single_device, TIMESTAMP, "Merged", "UTC")

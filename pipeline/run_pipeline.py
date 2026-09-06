@@ -76,22 +76,36 @@ def load_input_data(
     data_cfg = config["data"]
     ts_col = str(data_cfg["timestamp_column"])
     tz = str(data_cfg.get("timezone", "UTC"))
+    duplicate_strategy = str(data_cfg.get("duplicate_timestamps", "error"))
+    device_column = data_cfg.get("device_column") or None
 
-    reference_df = load_and_validate_dataset(
+    reference_df, reference_duplicates = load_and_validate_dataset(
         source=reference_source,
         timestamp_column=ts_col,
         dataset_name="Reference",
         timezone=tz,
+        duplicate_strategy=duplicate_strategy,
+        group_column=device_column,
+        group_value=data_cfg.get("reference_device") or None,
+        return_summary=True,
     )
-    sensor_df = load_and_validate_dataset(
+    sensor_df, sensor_duplicates = load_and_validate_dataset(
         source=sensor_source,
         timestamp_column=ts_col,
         dataset_name="LCS",
         timezone=tz,
+        duplicate_strategy=duplicate_strategy,
+        group_column=device_column,
+        group_value=data_cfg.get("sensor_device") or None,
+        return_summary=True,
     )
     return {
         "reference_raw": reference_df,
         "sensor_raw": sensor_df,
+        "duplicate_summary": {
+            "reference": reference_duplicates,
+            "sensor": sensor_duplicates,
+        },
     }
 
 

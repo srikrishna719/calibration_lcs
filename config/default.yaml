@@ -4,6 +4,15 @@ app:
 data:
   timestamp_column: timestamp
   target_column: pm25
+  # Rows sharing a timestamp mean the file holds more than one series (e.g. several
+  # co-located devices). error | first | last | mean | median. Keeping one arbitrary
+  # row per timestamp interleaves the devices, so that is not the default.
+  duplicate_timestamps: error
+  # Column identifying the device/site, and which one to keep. Leave null to be
+  # prompted, or set both to select a single series non-interactively.
+  device_column: null
+  reference_device: null
+  sensor_device: null
   timezone: UTC
   sensor_prefix: sensor
   reference_prefix: reference

@@ -15,7 +15,11 @@ from modules.alignment import (
     non_numeric_columns,
     resample_timeseries,
 )
-from modules.data_loader import load_and_validate_dataset, validate_dataset
+from modules.data_loader import (
+    load_and_validate_dataset,
+    summarize_duplicate_timestamps,
+    validate_dataset,
+)
 from pipeline.run_pipeline import run_alignment_stage, run_preprocessing_stage, load_input_data
 
 
@@ -124,10 +128,87 @@ class TestValidation:
         with pytest.raises(ValueError, match="at least one numeric"):
             validate_dataset(frame, "timestamp", "Reference")
 
-    def test_duplicate_timestamps_are_collapsed(self):
+class TestDuplicateTimestamps:
+    """A repeated timestamp means the file holds more than one series.
+
+    Keeping one arbitrary row per timestamp interleaves those series, so the
+    loader refuses until told how to resolve them.
+    """
+
+    @staticmethod
+    def _two_devices() -> pd.DataFrame:
+        stamps = pd.date_range("2024-01-01", periods=4, freq="h")
+        return pd.DataFrame({
+            "timestamp": list(stamps) * 2,
+            "device": ["A"] * 4 + ["B"] * 4,
+            "pm25": [10.0, 20, 30, 40, 12.0, 22, 32, 42],
+        })
+
+    def test_duplicates_raise_by_default(self):
+        with pytest.raises(ValueError, match="repeat a timestamp"):
+            load_and_validate_dataset(self._two_devices(), "timestamp", "Reference", "UTC")
+
+    def test_the_error_names_the_column_that_separates_them(self):
+        with pytest.raises(ValueError, match="'device'"):
+            load_and_validate_dataset(self._two_devices(), "timestamp", "Reference", "UTC")
+
+    def test_selecting_one_device_keeps_all_of_its_rows(self):
+        out = load_and_validate_dataset(
+            self._two_devices(), "timestamp", "Reference", "UTC",
+            duplicate_strategy="first", group_column="device", group_value="B",
+        )
+        assert len(out) == 4
+        assert out["pm25"].tolist() == [12.0, 22, 32, 42]
+
+    @pytest.mark.parametrize("strategy,expected", [("mean", 11.0), ("median", 11.0)])
+    def test_aggregation_combines_the_devices(self, strategy, expected):
+        out = load_and_validate_dataset(
+            self._two_devices(), "timestamp", "Reference", "UTC", duplicate_strategy=strategy
+        )
+        assert len(out) == 4
+        assert out["pm25"].iloc[0] == expected
+
+    def test_first_still_available_for_genuine_exact_duplicates(self):
         frame = pd.DataFrame({
             "timestamp": ["2024-01-01 00:00", "2024-01-01 00:00", "2024-01-01 01:00"],
-            "pm25": [1.0, 2.0, 3.0],
+            "pm25": [1.0, 1.0, 3.0],
         })
-        out = load_and_validate_dataset(frame, "timestamp", "Reference", "UTC")
-        assert len(out) == 2, "loader keeps one row per timestamp"
+        out = load_and_validate_dataset(frame, "timestamp", "Reference", "UTC",
+                                        duplicate_strategy="first")
+        assert len(out) == 2
+
+    def test_unique_timestamps_are_untouched(self, reference_csv):
+        out, summary = load_and_validate_dataset(
+            pd.read_csv(reference_csv), "timestamp", "Reference", "UTC", return_summary=True
+        )
+        assert not summary
+        assert summary.message() == "Timestamps are unique."
+        assert len(out) == len(pd.read_csv(reference_csv))
+
+    def test_summary_reports_what_was_done(self):
+        _, summary = load_and_validate_dataset(
+            self._two_devices(), "timestamp", "Reference", "UTC",
+            duplicate_strategy="first", group_column="device", group_value="A",
+            return_summary=True,
+        )
+        assert summary.group_value == "A"
+        assert "Kept only device='A'" in summary.message()
+
+    def test_unknown_strategy_is_rejected(self):
+        with pytest.raises(ValueError, match="strategy must be one of"):
+            load_and_validate_dataset(self._two_devices(), "timestamp", "Reference", "UTC",
+                                      duplicate_strategy="whatever")
+
+    def test_selecting_a_missing_device_is_reported(self):
+        with pytest.raises(ValueError, match="no rows with device='Z'"):
+            load_and_validate_dataset(self._two_devices(), "timestamp", "Reference", "UTC",
+                                      duplicate_strategy="first",
+                                      group_column="device", group_value="Z")
+
+    def test_group_column_detection_ignores_useless_columns(self):
+        frame = self._two_devices()
+        frame["constant"] = 1
+        frame["row_id"] = range(len(frame))
+        summary = summarize_duplicate_timestamps(frame, "timestamp")
+        assert "device" in summary.candidate_group_columns
+        assert "constant" not in summary.candidate_group_columns

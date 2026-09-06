@@ -68,6 +68,7 @@ from modules.drift_analysis import (
     generate_post_analysis_outputs,
 )
 from modules.download_helpers import render_chart_download, render_df_download
+from modules.data_loader import summarize_duplicate_timestamps
 from modules.leakage import find_target_encoding_columns
 from modules.normalization import get_normalization_summary, normalize_dataset
 from modules.diagnostics import COEFFICIENT_TABLE_COLUMNS, compute_vif, shapiro_wilk_test
@@ -773,6 +774,11 @@ def cached_eda(merged_df, cfg_text, raw_df=None):
 
 
 @st.cache_data(show_spinner=False)
+def cached_duplicate_summary(frame, timestamp_column):
+    return summarize_duplicate_timestamps(frame, timestamp_column)
+
+
+@st.cache_data(show_spinner=False)
 def cached_leakage_scan(merged_df, target_column):
     """Pairwise target-encoding scan; cached because it is quadratic in columns."""
     return find_target_encoding_columns(merged_df, target_column)
@@ -1136,6 +1142,104 @@ def render_upload():
         config["data"]["target_column"] = target_col
         config["data"]["timezone"] = tz
 
+    # ---- Repeated timestamps: several series in one file ----
+    # Resolved here rather than at load time, because keeping one arbitrary row
+    # per timestamp silently interleaves co-located devices.
+    try:
+        _ref_preview, _sen_preview, _ = resolve_inputs(ref_file, sen_file, use_sample)
+    except Exception:
+        _ref_preview = _sen_preview = None
+
+    if _ref_preview is not None and ts_col in _ref_preview.columns and ts_col in _sen_preview.columns:
+        ref_dupes = cached_duplicate_summary(_ref_preview, ts_col)
+        sen_dupes = cached_duplicate_summary(_sen_preview, ts_col)
+
+        if ref_dupes.duplicate_rows or sen_dupes.duplicate_rows:
+            with st.expander("⚠️ Repeated timestamps detected", expanded=True):
+                for label, summary in (("Reference", ref_dupes), ("LCS (Sensor)", sen_dupes)):
+                    if summary.duplicate_rows:
+                        st.warning(f"**{label}** — {summary.message()}")
+
+                shared = [
+                    c for c in ref_dupes.candidate_group_columns
+                    if c in sen_dupes.candidate_group_columns
+                ] or ref_dupes.candidate_group_columns or sen_dupes.candidate_group_columns
+
+                choices = {
+                    "Model one device (recommended)": "select",
+                    "Average the devices at each timestamp": "mean",
+                    "Median of the devices at each timestamp": "median",
+                    "Keep the first row per timestamp": "first",
+                }
+                if not shared:
+                    choices.pop("Model one device (recommended)")
+
+                choice_label = st.radio(
+                    "How should these be resolved?",
+                    list(choices.keys()),
+                    key="dup_strategy_choice",
+                    help=(
+                        "Each timestamp must identify one observation. Modelling a single "
+                        "device is the safest reading of co-location data; averaging builds "
+                        "a composite sensor; keeping the first row mixes devices together "
+                        "and is only right for genuine exact duplicates."
+                    ),
+                )
+                choice = choices[choice_label]
+
+                if choice == "select":
+                    device_column = st.selectbox(
+                        "Column identifying the device or site",
+                        shared,
+                        key="dup_group_column",
+                        help="Chosen because it makes timestamps unique.",
+                    )
+                    dc1, dc2 = st.columns(2)
+                    ref_options = sorted(_ref_preview[device_column].astype(str).unique()) \
+                        if device_column in _ref_preview.columns else []
+                    sen_options = sorted(_sen_preview[device_column].astype(str).unique()) \
+                        if device_column in _sen_preview.columns else []
+                    config["data"]["device_column"] = device_column
+                    config["data"]["duplicate_timestamps"] = "first"
+                    if ref_options:
+                        config["data"]["reference_device"] = dc1.selectbox(
+                            "Reference series", ref_options, key="dup_ref_device")
+                    if sen_options:
+                        config["data"]["sensor_device"] = dc2.selectbox(
+                            "Sensor series", sen_options, key="dup_sen_device")
+
+                    # Selecting a series only helps the dataset that carries the
+                    # column. Say plainly what happens to one that it cannot fix,
+                    # rather than letting the "first" fallback apply quietly.
+                    for label, frame, chosen in (
+                        ("Reference", _ref_preview, config["data"].get("reference_device")),
+                        ("LCS (Sensor)", _sen_preview, config["data"].get("sensor_device")),
+                    ):
+                        if device_column in frame.columns and chosen is not None:
+                            remaining = frame[frame[device_column].astype(str) == str(chosen)]
+                        else:
+                            remaining = frame
+                        if remaining[ts_col].duplicated().any():
+                            st.caption(
+                                f"⚠️ {label} still has repeated timestamps after this "
+                                f"selection ({int(remaining[ts_col].duplicated().sum())} rows). "
+                                "The first row of each will be kept — use an averaging option "
+                                "instead if those are separate series rather than exact repeats."
+                            )
+                else:
+                    config["data"]["duplicate_timestamps"] = choice
+                    config["data"]["device_column"] = None
+                    config["data"]["reference_device"] = None
+                    config["data"]["sensor_device"] = None
+        else:
+            config["data"]["duplicate_timestamps"] = "error"
+
+    duplicate_settings = {
+        key: config["data"].get(key)
+        for key in ("duplicate_timestamps", "device_column", "reference_device", "sensor_device")
+    }
+    st.session_state.config = config
+
     if st.button("🚀 Load & Validate Data", key="run_upload", width='stretch',
                  help="Loads, parses and validates both CSV files. Any format errors will be shown below."):
         try:
@@ -1144,6 +1248,7 @@ def render_upload():
             config["data"]["timestamp_column"] = ts_col
             config["data"]["target_column"] = target_col
             config["data"]["timezone"] = tz
+            config["data"].update(duplicate_settings)
             cfg_text = _cfg_to_json(config)
             data_out = cached_load_input(ref_src, sen_src, cfg_text)
             st.session_state.config = config
