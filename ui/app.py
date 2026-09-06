@@ -66,6 +66,7 @@ from modules.download_helpers import render_chart_download, render_df_download
 from config.validation import load_config_text
 from evaluation.metrics import MAPE_MIN_DENOMINATOR
 from modules.data_loader import summarize_duplicate_timestamps
+from modules.feature_engineering import dataset_span_days, monotonic_time_features
 from modules.leakage import find_reference_encoding_columns, find_target_encoding_columns
 from modules.normalization import get_normalization_summary, normalize_dataset
 from modules.diagnostics import COEFFICIENT_TABLE_COLUMNS, compute_vif, shapiro_wilk_test
@@ -291,6 +292,44 @@ def _prediction_scope_caption(scope: str) -> str:
     if scope == "validation":
         return "Showing validation predictions. These are the predictions used for leaderboard metrics."
     return "Showing full fitted predictions from the final model refit on all available modelling rows."
+
+
+def _render_time_feature_validation_warning(
+    model_df: pd.DataFrame,
+    timestamp_column: str,
+    validation_method: str,
+) -> None:
+    """Warn when a never-repeating time feature is scored by shuffled K-Fold.
+
+    That pairing is the one that misleads: the feature cannot generalise past
+    the training window, and shuffling interleaves past and future so the fold
+    scores go *up* rather than down. A user comparing models on K-Fold would
+    pick close to the worst one.
+    """
+    if timestamp_column not in model_df.columns:
+        return
+
+    span = dataset_span_days(model_df[timestamp_column])
+    flagged = monotonic_time_features(model_df.columns, span)
+    if not flagged:
+        return
+
+    names = ", ".join(f"`{name}`" for name in flagged)
+    span_note = f" over {span:.0f} days of data" if span else ""
+
+    if str(validation_method).strip().lower() == "kfold":
+        st.warning(
+            f"**{names} cannot generalise beyond the training period{span_note}, and K-Fold "
+            "will not show it.** Shuffled folds interleave past and future, so the reported "
+            "score goes up while the model gets worse on later data. Use TimeSeriesSplit or "
+            "Holdout to see the real effect, or turn this off on the Feature Engineering step."
+        )
+    else:
+        st.info(
+            f"{names}: values that never repeat{span_note}, so they suit reconstructing this "
+            "study period rather than a model applied to new data. The chronological validation "
+            "you have selected will reflect that; K-Fold would hide it."
+        )
 
 
 def _render_outlier_breakdown(label: str, summary) -> None:
@@ -1689,12 +1728,22 @@ def render_feature_engineering():
                 st.caption("Basic features (hour 0-23, day-of-week 0-6, day-of-month 1-31) always included. Enable extras:")
                 tc1, tc2, tc3 = st.columns(3)
                 tf = {"hour_of_day": True, "day_of_week": True, "day_of_month": True}
+                _forward_note = (
+                    " Only increases over a single deployment, so a model uses it to fit a "
+                    "trend it cannot continue past the training window. Measured on a "
+                    "three-month co-location, adding this took a random forest from 0.271 to "
+                    "0.218 R2 applied forward, and ridge below zero, while *raising* its "
+                    "K-Fold score. Useful for reconstructing the study period itself; not for "
+                    "a model you will apply to new data."
+                )
                 tf["unix_timestamp"] = tc1.checkbox("Unix timestamp", value=existing_tf.get("unix_timestamp", False), key="fe_tf_unix",
-                    help="Seconds since 1970-01-01. Useful as a linear time trend proxy for tree models.")
+                    help="Seconds since 1970-01-01." + _forward_note)
                 tf["julian_date"] = tc1.checkbox("Julian date (DOY)", value=existing_tf.get("julian_date", False), key="fe_tf_julian",
-                    help="Day-of-year (1-366). Captures seasonal variation without cyclical encoding.")
+                    help="Day-of-year (1-366). Genuinely seasonal once the data spans more than "
+                         "a year; within a shorter campaign it rises monotonically and behaves "
+                         "like a trend." + _forward_note)
                 tf["calendar_date"] = tc1.checkbox("Calendar date (int)", value=existing_tf.get("calendar_date", False), key="fe_tf_caldate",
-                    help="Integer days since 1970-01-01, day-resolution. Good for long-term trend.")
+                    help="Integer days since 1970-01-01, day-resolution." + _forward_note)
                 tf["cyclical_hour"] = tc2.checkbox("Cyclical hour sin/cos", value=existing_tf.get("cyclical_hour", False), key="fe_tf_cychour",
                     help="Encodes hour as sin/cos so hour 23 is treated as close to hour 0. Better than raw integer for linear models.")
                 tf["cyclical_dow"] = tc2.checkbox("Cyclical DOW sin/cos", value=existing_tf.get("cyclical_dow", False), key="fe_tf_cydow",
@@ -1938,6 +1987,10 @@ def render_modelling():
         config["training"]["test_size"] = test_size
         config["training"]["cross_validation_folds"] = cv_folds
         config["training"]["validation_method"] = validation_labels[validation_label]
+
+        _render_time_feature_validation_warning(
+            model_df, ts_col, config["training"]["validation_method"]
+        )
 
         st.markdown("**Model selection**")
         st.caption(
