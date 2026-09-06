@@ -58,9 +58,12 @@ evaluation/
 pipeline/
   run_pipeline.py        — 7-stage orchestrator (load → preprocess → align → EDA → model → post-analysis → export)
 ui/
-  app.py                 — 13-step Streamlit UI with custom CSS theming
+  app.py                 — 13-step Streamlit workflow
+  theme.py               — Light/dark palettes and the CSS block
+  model_guide.py         — Per-model reference content shown on the Modelling step
 config/
   default.yaml           — Full pipeline configuration
+  validation.py          — Fills missing sections from defaults; rejects unusable values by name
 sample_data/
   reference_dataset.csv         — 7-day reference-grade demo dataset (168 rows)
   low_cost_sensor_dataset.csv   — 7-day LCS demo dataset (168 rows)
@@ -156,6 +159,15 @@ See [CHANGELOG.md](CHANGELOG.md) for full details.
 - Auto-tuning searches inside each validation fold, so tuned metrics stay honest; it
   costs roughly one extra search per fold.
 - Residuals are `predicted - actual` throughout.
+- MAPE excludes reference values below 1 ug/m3, where a percentage reflects the
+  near-zero denominator rather than the model; the excluded share is reported
+  alongside it. Judge low-concentration performance by RMSE or MAE.
+- Outlier removal drops a row when any screened column flags it, so the loss grows
+  with column count. The Preprocessing step breaks down what each column
+  contributes; `preprocessing.outlier_columns` narrows the screen.
+- A partial config file is completed from the packaged defaults, so it only needs
+  the settings you want to override. Unknown top-level sections are reported as
+  likely typos rather than silently ignored.
 - Alignment uses resampling + cross-correlation-based lag detection before merging.
 - All exports include provenance metadata for reproducibility.
 - The UI provides full control over every pipeline parameter at each step.
