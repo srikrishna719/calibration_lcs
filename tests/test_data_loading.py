@@ -6,6 +6,7 @@ which raised an opaque pandas TypeError on data that had uploaded cleanly.
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -73,6 +74,24 @@ class TestAlignment:
     def test_merged_frame_has_prefixed_columns(self, merged):
         assert "reference_pm25" in merged.columns
         assert any(c.startswith("sensor_") for c in merged.columns)
+
+    @pytest.mark.parametrize("sensor_column", ["pm25", "pm25_raw"])
+    def test_shared_column_names_do_not_break_lag_detection(self, _base_config, sensor_column):
+        """A sensor CSV whose channel is also called "pm25" is the natural case."""
+        stamps = pd.date_range("2024-01-01", periods=48, freq="h")
+        ref = pd.DataFrame({"timestamp": stamps, "pm25": np.linspace(10, 60, 48)})
+        sen = pd.DataFrame({"timestamp": stamps, sensor_column: np.linspace(12, 66, 48)})
+
+        cfg = dict(_base_config["alignment"])
+        cfg["max_lag_steps"] = 2
+        merged, meta = align_and_merge_datasets(
+            reference_df=ref, sensor_df=sen, timestamp_column="timestamp",
+            reference_target_column="pm25", sensor_prefix="sensor",
+            reference_prefix="reference", config=cfg,
+        )
+        assert "reference_pm25" in merged.columns
+        assert f"sensor_{sensor_column}" in merged.columns
+        assert isinstance(meta["lag_steps"], int)
 
     def test_no_overlap_raises(self, _base_config):
         ref = pd.DataFrame({

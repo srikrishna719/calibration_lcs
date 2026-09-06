@@ -68,6 +68,7 @@ from modules.drift_analysis import (
     generate_post_analysis_outputs,
 )
 from modules.download_helpers import render_chart_download, render_df_download
+from modules.leakage import find_target_encoding_columns
 from modules.normalization import get_normalization_summary, normalize_dataset
 from modules.diagnostics import COEFFICIENT_TABLE_COLUMNS, compute_vif, shapiro_wilk_test
 from modules.plots import (
@@ -769,6 +770,12 @@ def cached_alignment(ref_df, sen_df, cfg_text):
 @st.cache_data(show_spinner=False)
 def cached_eda(merged_df, cfg_text, raw_df=None):
     return run_eda_stage(merged_df, json.loads(cfg_text), raw_merged_df=raw_df)
+
+
+@st.cache_data(show_spinner=False)
+def cached_leakage_scan(merged_df, target_column):
+    """Pairwise target-encoding scan; cached because it is quadratic in columns."""
+    return find_target_encoding_columns(merged_df, target_column)
 
 
 @st.cache_data(show_spinner=False)
@@ -1657,6 +1664,35 @@ def render_variable_selection():
     )
 
     predictor_options = [c for c in numeric_cols if c != target]
+
+    # Columns that reconstruct the target algebraically -- a sensor-minus-reference
+    # difference, a residual, a renamed copy of the target. A model using one scores
+    # near-perfectly and has learned nothing, and correlation does not reveal them,
+    # so this is a pairwise fit against the chosen target.
+    leakage = cached_leakage_scan(merged, target)
+    leaking = [c for c in predictor_options if c in leakage.excluded]
+    if leaking:
+        st.error(
+            "**Excluded from predictors: these columns encode the target.**\n\n"
+            + "\n".join(
+                f"- `{name}` — {leakage.reasons[name]}" for name in leaking
+            )
+        )
+        allow_leaking = st.checkbox(
+            "Offer them anyway (I know these columns are independent)",
+            value=False,
+            key="var_sel_allow_leaking",
+            help=(
+                "Leave off unless the detection is wrong for your data. A model trained on "
+                "a column that carries the reference value will report near-perfect metrics "
+                "and cannot be applied to a sensor on its own."
+            ),
+        )
+        if not allow_leaking:
+            predictor_options = [c for c in predictor_options if c not in leaking]
+    elif leakage.skipped_reason:
+        st.caption(f"Target-encoding check skipped: {leakage.skipped_reason}")
+
     reference_options = [c for c in predictor_options if c.startswith(f"{reference_prefix}_")]
     sensor_options = [c for c in predictor_options if c.startswith(f"{sensor_prefix}_")]
     other_options = [

@@ -35,6 +35,7 @@ from modules.exporter import (
     export_project_run_json_bytes,
 )
 from modules.feature_engineering import append_time_features, engineer_sensor_features
+from modules.leakage import LeakageReport, find_target_encoding_columns
 from modules.normalization import get_normalization_summary, normalize_dataset
 from modules.preprocessing import preprocess_dataset
 
@@ -190,6 +191,33 @@ def run_eda_stage(
 # Predictor selection
 # -----------------------------------------------------------------------
 
+def screen_target_encoding_columns(
+    dataframe: Any,
+    timestamp_column: str,
+    target_column: str,
+    config: Dict[str, Any],
+) -> tuple[Any, "LeakageReport"]:
+    """Drop predictors that reconstruct the target, before anything derives from them.
+
+    Runs on the merged frame rather than the engineered one: a leaking base
+    column would otherwise spawn leaking lag, rolling and interaction columns,
+    and the pairwise scan does not scale to a wide engineered frame anyway. Set
+    ``training.include_target_encoding_predictors`` to keep them.
+    """
+    report = LeakageReport()
+    if bool(config.get("training", {}).get("include_target_encoding_predictors", False)):
+        return dataframe, report
+
+    candidates = [
+        c for c in dataframe.select_dtypes(include="number").columns
+        if c not in (timestamp_column, target_column)
+    ]
+    report = find_target_encoding_columns(dataframe, target_column, candidates)
+    if not report.excluded:
+        return dataframe, report
+    return dataframe.drop(columns=report.excluded, errors="ignore"), report
+
+
 def deployable_feature_subset(
     dataframe: Any,
     timestamp_column: str,
@@ -240,6 +268,10 @@ def run_modeling_stage(
     data_cfg = config["data"]
     ts_col = str(data_cfg["timestamp_column"])
     target_col = f"{data_cfg['reference_prefix']}_{data_cfg['target_column']}"
+
+    merged_df, leakage_report = screen_target_encoding_columns(
+        merged_df, ts_col, target_col, config
+    )
 
     featured_df = engineer_sensor_features(
         dataframe=merged_df,
@@ -322,6 +354,7 @@ def run_modeling_stage(
         "calibrated_dataset": calibrated,
         "scaler": fitted_scaler(best.model),
         "normalization_outputs": normalization_outputs,
+        "leakage_report": leakage_report,
     }
 
 

@@ -108,16 +108,26 @@ def detect_optimal_lag(
     int
         Optimal lag in timesteps.  Positive = sensor leads.
     """
-    merged = reference_df[[timestamp_column, reference_target_column]].merge(
-        sensor_df[[timestamp_column, sensor_feature_column]],
-        on=timestamp_column,
-        how="inner",
-    ).dropna()
+    # Rename before merging: the reference target and the sensor channel are
+    # very often both called e.g. "pm25", and pandas would then suffix them to
+    # pm25_x / pm25_y, so looking them up by their original names would fail.
+    reference_series_name, sensor_series_name = "_reference_series", "_sensor_series"
+    merged = (
+        reference_df[[timestamp_column, reference_target_column]]
+        .rename(columns={reference_target_column: reference_series_name})
+        .merge(
+            sensor_df[[timestamp_column, sensor_feature_column]]
+            .rename(columns={sensor_feature_column: sensor_series_name}),
+            on=timestamp_column,
+            how="inner",
+        )
+        .dropna()
+    )
     if merged.empty:
         return 0
 
-    ref_series = merged[reference_target_column]
-    sen_series = merged[sensor_feature_column]
+    ref_series = merged[reference_series_name]
+    sen_series = merged[sensor_series_name]
     best_lag = 0
     best_score = -np.inf
 

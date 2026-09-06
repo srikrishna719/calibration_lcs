@@ -54,6 +54,10 @@ training:
   # against; a deployed sensor will not have them. Set true only for co-location
   # analysis where using them is the point.
   include_reference_predictors: false
+  # Columns that reconstruct the target algebraically (e.g. a
+  # sensor-minus-reference difference) are detected and dropped. Set true
+  # only if you know a flagged column is genuinely independent.
+  include_target_encoding_predictors: false
   cross_validation_folds: 5
   validation_method: timeseriessplit
   selected_models:
