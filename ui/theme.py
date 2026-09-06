@@ -49,6 +49,22 @@ html, body, [class*="st-"] {
     font-family: 'Inter', sans-serif;
 }
 
+/* Streamlit draws its icons as Material Symbols ligatures, and its icon spans
+   carry st- classes, so the rule above was overriding the icon font and the
+   ligature fell back to its own name as literal text ("keyboard_double_arrow_left"
+   on the sidebar toggle, "upload" on the file uploader). The font is self-hosted
+   by Streamlit under this exact family name. */
+span[data-testid="stIconMaterial"] {
+    font-family: 'Material Symbols Rounded' !important;
+    font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+    letter-spacing: normal;
+    text-transform: none;
+    white-space: nowrap;
+    direction: ltr;
+    -webkit-font-feature-settings: 'liga';
+    -webkit-font-smoothing: antialiased;
+}
+
 /* Page-wide chrome (keeps native Streamlit containers in sync with the toggle,
    overriding Streamlit's own auto-detected OS/browser theme so the in-app
    toggle is authoritative regardless of the visitor's environment) */
@@ -277,36 +293,6 @@ section[data-testid="stSidebar"] .stRadio label {
     margin-bottom: 0.3rem;
 }
 
-/* ============================================================
-   Fix: Streamlit 1.56 expander icon fallback text overlap
-   Root cause: 'keyboard_arrow_right'/'keyboard_arrow_down' text
-   renders as literal characters when Material Icons font fails.
-   Structure: details > summary > span > span > span (icon text)
-   ============================================================ */
-
-/* The icon span — completely suppress fallback text, show only the glyph */
-[data-testid="stExpander"] details summary span span span {
-    font-family: 'Material Icons', 'Material Icons Outlined', serif;
-    font-size: 0 !important;  /* hide raw text fallback */
-    display: inline-block;
-    width: 0;
-    height: 0;
-    overflow: hidden;
-    flex-shrink: 0;
-}
-/* Use parent span to show a clean arrow via CSS */
-[data-testid="stExpander"] details summary > span > span:first-child::before {
-    content: '▶';
-    font-size: 0.7rem;
-    color: $subtext;
-    display: inline-block;
-    transition: transform 0.2s ease;
-    margin-right: 2px;
-}
-[data-testid="stExpander"] details[open] summary > span > span:first-child::before {
-    content: '▼';
-}
-
 /* The summary row itself: flex layout to prevent overflow bleeding */
 [data-testid="stExpander"] details summary > span {
     display: flex;
@@ -335,15 +321,6 @@ section[data-testid="stSidebar"] .stRadio > label {
     margin-bottom: 0.5rem;
 }
 
-/* File uploader button — suppress Material Icons fallback text ('upload' literal) */
-/* Structure: button > span > span > span (icon text) + div > p (label text) */
-[data-testid="stFileUploader"] button span span span {
-    font-size: 0 !important;
-    width: 0;
-    height: 0;
-    overflow: hidden;
-    display: inline-block;
-}
 /* Show a clean upload arrow via the parent span instead */
 [data-testid="stFileUploader"] button > span > span:first-child::before {
     content: '⬆';
