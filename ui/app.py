@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import io
+import re
 import sys
 import traceback
 from pathlib import Path
@@ -69,6 +70,14 @@ from modules.data_loader import list_excel_sheets, read_tabular, summarize_dupli
 from modules.feature_engineering import dataset_span_days, monotonic_time_features
 from modules.leakage import find_reference_encoding_columns, find_target_encoding_columns
 from modules.normalization import get_normalization_summary, normalize_dataset
+from modules.units import (
+    AXIS_UNITS,
+    CUSTOM_UNIT,
+    format_axis_label,
+    resolve_unit,
+    suggest_unit,
+    unit_index,
+)
 from modules.diagnostics import COEFFICIENT_TABLE_COLUMNS, compute_vif, shapiro_wilk_test
 from modules.plots import (
     apply_legend_layout,
@@ -257,6 +266,35 @@ def _format_coefficient_table(coef_table) -> pd.DataFrame:
     return df
 
 
+def _slug(text: str, limit: int = 40) -> str:
+    """Lowercase, punctuation-free fragment safe to embed in a widget key."""
+    return re.sub(r"[^a-z0-9]+", "_", (text or "").lower()).strip("_")[:limit]
+
+
+def _customization_keys(key_prefix: str, subject: str, x_source: str, y_source: str):
+    """Widget keys for one chart's customization block.
+
+    Streamlit keeps a widget's value for as long as its key is stable, and only
+    honours the supplied default on the first render. Keying these on the chart
+    alone meant that plotting a different column left the previous column's
+    title and axis text in place -- a histogram of temperature still labelled
+    reference_pm25. Folding the subject into the key re-defaults the block when
+    the chart changes subject, and brings a previous edit back if you return to
+    the same one.
+
+    Unit pickers hang off their own axis source, so an axis whose meaning did
+    not change keeps its unit even when the other axis did.
+    """
+    subject_slug = _slug(subject)
+    return {
+        "title": f"{key_prefix}__{subject_slug}_title",
+        "x": f"{key_prefix}__{subject_slug}_x",
+        "y": f"{key_prefix}__{subject_slug}_y",
+        "x_unit": f"{key_prefix}_x_unit__{_slug(x_source)}",
+        "y_unit": f"{key_prefix}_y_unit__{_slug(y_source)}",
+    }
+
+
 LEGEND_POSITION_LABELS = {
     "Above the chart": "top",
     "Right of the chart": "right",
@@ -271,18 +309,57 @@ def _chart_customization(
     default_x: str,
     default_y: str,
     legend: bool = False,
+    unit_hint_x: Optional[str] = None,
+    unit_hint_y: Optional[str] = None,
 ):
     """Render editable title/axis inputs and return (title, x_label, y_label).
+
+    The returned axis labels already carry whatever unit was picked, so callers
+    apply them unchanged and every chart formats units identically.
 
     With ``legend=True`` the expander also carries legend controls. Those are
     read back separately by :func:`_legend_settings`, so the return shape stays
     the same for the charts that do not need them.
     """
     with st.expander("\u2699\ufe0f Chart Customization", expanded=False):
-        title = st.text_input("Title", value=default_title, key=f"{key_prefix}_title")
+        x_source = unit_hint_x if unit_hint_x is not None else default_x
+        y_source = unit_hint_y if unit_hint_y is not None else default_y
+        keys = _customization_keys(
+            key_prefix, f"{default_title}|{default_x}|{default_y}", x_source, y_source
+        )
+        x_key, y_key = keys["x_unit"], keys["y_unit"]
+
+        title = st.text_input("Title", value=default_title, key=keys["title"])
         c1, c2 = st.columns(2)
-        x_label = c1.text_input("X-axis label", value=default_x, key=f"{key_prefix}_x")
-        y_label = c2.text_input("Y-axis label", value=default_y, key=f"{key_prefix}_y")
+        x_label = c1.text_input("X-axis label", value=default_x, key=keys["x"])
+        y_label = c2.text_input("Y-axis label", value=default_y, key=keys["y"])
+
+        u1, u2 = st.columns(2)
+        x_unit_choice = u1.selectbox(
+            "X-axis unit",
+            AXIS_UNITS,
+            index=unit_index(suggest_unit(x_source)),
+            key=x_key,
+            help=(
+                "Appended to the axis label in parentheses, so a label of "
+                "\"Actual\" with µg/m³ is drawn as \"Actual (µg/m³)\". "
+                "The starting value is suggested from the column name; nothing "
+                "in the pipeline checks what units a file is really in, so "
+                "change it if it does not match your data."
+            ),
+        )
+        y_unit_choice = u2.selectbox(
+            "Y-axis unit",
+            AXIS_UNITS,
+            index=unit_index(suggest_unit(y_source)),
+            key=y_key,
+            help="Suggested from the column name, and editable.",
+        )
+        x_custom = y_custom = ""
+        if x_unit_choice == CUSTOM_UNIT:
+            x_custom = u1.text_input("X-axis custom unit", value="", key=f"{x_key}_custom")
+        if y_unit_choice == CUSTOM_UNIT:
+            y_custom = u2.text_input("Y-axis custom unit", value="", key=f"{y_key}_custom")
         if legend:
             st.divider()
             l1, l2 = st.columns([1, 1])
@@ -309,6 +386,8 @@ def _chart_customization(
                     "picker to choose what is plotted."
                 ),
             )
+    x_label = format_axis_label(x_label, resolve_unit(x_unit_choice, x_custom))
+    y_label = format_axis_label(y_label, resolve_unit(y_unit_choice, y_custom))
     return title, x_label, y_label
 
 
@@ -2438,7 +2517,8 @@ def render_results():
         scatter_predictions = _prediction_frame(result, prediction_scope)
         fig_scatter = create_scatter_with_fit(scatter_predictions, model_name=sel_name)
         title, x_label, y_label = _chart_customization(
-            "res_scatter", f"Predicted vs Actual — {sel_name}", "Actual", "Predicted"
+            "res_scatter", f"Predicted vs Actual — {sel_name}", "Actual", "Predicted",
+            unit_hint_x=st.session_state.get("selected_target"), unit_hint_y=st.session_state.get("selected_target"),
         )
         fig_scatter.update_layout(title=title, xaxis_title=x_label, yaxis_title=y_label)
         _display_chart_with_downloads(
@@ -2485,7 +2565,7 @@ def render_results():
                 start_ts = end_ts = None
             title, x_label, y_label = _chart_customization(
                 "res_multi_ts", "Multi-Model Time-Series Overlay", "Time", "Concentration",
-                legend=True,
+                legend=True, unit_hint_y=st.session_state.get("selected_target"),
             )
             legend_pos, legend_click = _legend_settings("res_multi_ts")
             fig_multi_ts = create_multi_model_timeseries(
@@ -2625,6 +2705,7 @@ def render_residual_analysis():
     with tabs[0]:
         title_1, x_1, y_1 = _chart_customization(
             "ra_pva", "Predicted vs Actual", "Actual (Reference)", "Predicted (Calibrated)",
+            unit_hint_x=st.session_state.get("selected_target"), unit_hint_y=st.session_state.get("selected_target"),
         )
         fig_pva = create_predicted_vs_actual_figure(predictions_df)
         fig_pva.update_layout(title=title_1, xaxis_title=x_1, yaxis_title=y_1)
@@ -2635,6 +2716,7 @@ def render_residual_analysis():
     with tabs[1]:
         title_2, x_2, y_2 = _chart_customization(
             "ra_rvf", "Residual vs Fitted", "Predicted Value", "Residual (Predicted − Actual)",
+            unit_hint_x=st.session_state.get("selected_target"), unit_hint_y=st.session_state.get("selected_target"),
         )
         fig_rvf = create_residual_vs_predicted_figure(predictions_df)
         fig_rvf.update_layout(title=title_2, xaxis_title=x_2, yaxis_title=y_2)
@@ -2648,6 +2730,7 @@ def render_residual_analysis():
     with tabs[2]:
         title_3, x_3, y_3 = _chart_customization(
             "ra_hist", "Residual Distribution", "Residual (Predicted − Actual)", "Frequency",
+            unit_hint_x=st.session_state.get("selected_target"),
         )
         fig_hist = create_residual_histogram(predictions_df)
         fig_hist.update_layout(title=title_3, xaxis_title=x_3, yaxis_title=y_3)
@@ -2661,6 +2744,7 @@ def render_residual_analysis():
         title_4, x_4, y_4 = _chart_customization(
             "ra_qq", "QQ Plot — Residuals vs Normal Distribution",
             "Theoretical Quantiles", "Sample Quantiles",
+            unit_hint_y=st.session_state.get("selected_target"),
         )
         fig_qq = create_qq_plot(predictions_df)
         fig_qq.update_layout(title=title_4, xaxis_title=x_4, yaxis_title=y_4)
