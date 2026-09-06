@@ -17,6 +17,73 @@ from plotly.subplots import make_subplots
 
 
 # ---------------------------------------------------------------------------
+# Legend layout
+# ---------------------------------------------------------------------------
+
+LEGEND_POSITIONS = ("top", "right", "bottom", "hidden")
+
+
+def apply_legend_layout(
+    fig: go.Figure,
+    position: str = "top",
+    interactive: bool = False,
+) -> go.Figure:
+    """Place a figure's legend, and decide whether legend clicks hide traces.
+
+    ``interactive=False`` is the default because a legend click is browser-side
+    state that never reaches Python. The PNG download is rendered here from the
+    figure object, so a chart the user narrowed by clicking legend entries would
+    still export with every trace present -- the picture and the file disagree,
+    silently. Leaving clicks off keeps the download equal to what is on screen;
+    the caller's variable picker is what filters, and it drives both.
+
+    ``position`` is one of :data:`LEGEND_POSITIONS`. A wide horizontal legend
+    above the plot wraps onto the title once the names are long or numerous,
+    which is why "right" exists.
+    """
+    if position not in LEGEND_POSITIONS:
+        raise ValueError(
+            f"Unknown legend position {position!r}. Valid positions: "
+            + ", ".join(LEGEND_POSITIONS)
+        )
+
+    if position == "hidden":
+        fig.update_layout(showlegend=False, margin=dict(t=80, b=70, l=60, r=30))
+        return fig
+
+    placement = {
+        "top": (
+            dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+            dict(t=110, b=70, l=60, r=30),
+        ),
+        "right": (
+            dict(orientation="v", yanchor="top", y=1.0, xanchor="left", x=1.02),
+            dict(t=80, b=70, l=60, r=210),
+        ),
+        "bottom": (
+            dict(orientation="h", yanchor="top", y=-0.18, xanchor="center", x=0.5),
+            dict(t=80, b=120, l=60, r=30),
+        ),
+    }
+    anchor_kwargs, margin = placement[position]
+
+    fig.update_layout(
+        showlegend=True,
+        legend=dict(
+            **anchor_kwargs,
+            font=dict(size=11),
+            bgcolor="rgba(0,0,0,0)",
+            borderwidth=0,
+            itemsizing="constant",
+            itemclick="toggle" if interactive else False,
+            itemdoubleclick="toggleothers" if interactive else False,
+        ),
+        margin=margin,
+    )
+    return fig
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
@@ -215,7 +282,12 @@ def create_multi_model_scatter(
 # Multi-model time-series overlay
 # ---------------------------------------------------------------------------
 
-def create_multi_model_timeseries(training_results: Dict, prediction_scope: str = "full") -> go.Figure:
+def create_multi_model_timeseries(
+    training_results: Dict,
+    prediction_scope: str = "full",
+    legend_position: str = "top",
+    legend_interactive: bool = False,
+) -> go.Figure:
     """Overlay time-series of all model predictions against the reference."""
     if not training_results:
         return go.Figure()
@@ -243,10 +315,8 @@ def create_multi_model_timeseries(training_results: Dict, prediction_scope: str 
         title="Multi-Model Time-Series Overlay",
         xaxis_title="Time", yaxis_title="Concentration",
         template="plotly_dark",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
-        margin=dict(t=90, b=70, l=60, r=30),
     )
-    return fig
+    return apply_legend_layout(fig, legend_position, legend_interactive)
 
 
 # ---------------------------------------------------------------------------

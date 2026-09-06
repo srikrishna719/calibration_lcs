@@ -13,6 +13,8 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 
+from modules.plots import apply_legend_layout
+
 
 # ---------------------------------------------------------------------------
 # Missing value analysis
@@ -212,8 +214,14 @@ def create_time_series_figure(
     dataframe: pd.DataFrame,
     timestamp_column: str,
     columns: Optional[List[str]] = None,
+    legend_position: str = "top",
+    legend_interactive: bool = False,
 ) -> go.Figure:
-    """Create a time-series overlay of numeric columns."""
+    """Create a time-series overlay of numeric columns.
+
+    Only ``columns`` are drawn, so the figure -- and therefore the PNG rendered
+    from it -- carries exactly the variables the caller asked for.
+    """
     if columns is None:
         columns = dataframe.select_dtypes(include="number").columns.tolist()[:6]
 
@@ -236,11 +244,10 @@ def create_time_series_figure(
         xaxis_title="Time",
         yaxis_title="Value",
         template="plotly_dark",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
         font=dict(size=14),
         title_font=dict(size=20),
     )
-    return fig
+    return apply_legend_layout(fig, legend_position, legend_interactive)
 
 
 # ---------------------------------------------------------------------------

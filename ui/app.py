@@ -71,6 +71,7 @@ from modules.leakage import find_reference_encoding_columns, find_target_encodin
 from modules.normalization import get_normalization_summary, normalize_dataset
 from modules.diagnostics import COEFFICIENT_TABLE_COLUMNS, compute_vif, shapiro_wilk_test
 from modules.plots import (
+    apply_legend_layout,
     create_multi_model_metrics_bar,
     create_predicted_vs_actual_figure,
     create_qq_plot,
@@ -256,14 +257,66 @@ def _format_coefficient_table(coef_table) -> pd.DataFrame:
     return df
 
 
-def _chart_customization(key_prefix: str, default_title: str, default_x: str, default_y: str):
-    """Render editable title/axis inputs and return (title, x_label, y_label)."""
+LEGEND_POSITION_LABELS = {
+    "Above the chart": "top",
+    "Right of the chart": "right",
+    "Below the chart": "bottom",
+    "Hidden": "hidden",
+}
+
+
+def _chart_customization(
+    key_prefix: str,
+    default_title: str,
+    default_x: str,
+    default_y: str,
+    legend: bool = False,
+):
+    """Render editable title/axis inputs and return (title, x_label, y_label).
+
+    With ``legend=True`` the expander also carries legend controls. Those are
+    read back separately by :func:`_legend_settings`, so the return shape stays
+    the same for the charts that do not need them.
+    """
     with st.expander("\u2699\ufe0f Chart Customization", expanded=False):
         title = st.text_input("Title", value=default_title, key=f"{key_prefix}_title")
         c1, c2 = st.columns(2)
         x_label = c1.text_input("X-axis label", value=default_x, key=f"{key_prefix}_x")
         y_label = c2.text_input("Y-axis label", value=default_y, key=f"{key_prefix}_y")
+        if legend:
+            st.divider()
+            l1, l2 = st.columns([1, 1])
+            l1.selectbox(
+                "Legend position",
+                list(LEGEND_POSITION_LABELS),
+                index=0,
+                key=f"{key_prefix}_legend_pos",
+                help=(
+                    "Move the legend off the plot when the series names are "
+                    "long or numerous. A horizontal legend wraps onto the "
+                    "title once there are more than a few of them."
+                ),
+            )
+            l2.checkbox(
+                "Legend clicks hide series",
+                value=False,
+                key=f"{key_prefix}_legend_click",
+                help=(
+                    "Off by default. Hiding a series by clicking its legend "
+                    "entry changes the browser view only: the PNG is rendered "
+                    "from the figure and would still carry every series. Left "
+                    "off, the download matches what you see -- use the variable "
+                    "picker to choose what is plotted."
+                ),
+            )
     return title, x_label, y_label
+
+
+def _legend_settings(key_prefix: str):
+    """Read back the legend choices rendered by :func:`_chart_customization`."""
+    label = st.session_state.get(f"{key_prefix}_legend_pos", "Above the chart")
+    position = LEGEND_POSITION_LABELS.get(label, "top")
+    return position, bool(st.session_state.get(f"{key_prefix}_legend_click", False))
 
 
 def _display_chart_with_downloads(fig, source_df, key: str, filename_prefix: str):
@@ -1465,11 +1518,18 @@ def render_eda():
                 st.warning("Select at least one variable to plot.")
             else:
                 from modules.eda import create_time_series_figure
-                fig_ts = create_time_series_figure(merged, ts_col, selected_ts_cols)
                 title, x_label, y_label = _chart_customization(
-                    "eda_ts", "Time-Series Overview", "Time", "Value"
+                    "eda_ts", "Time-Series Overview", "Time", "Value", legend=True
+                )
+                legend_pos, legend_click = _legend_settings("eda_ts")
+                fig_ts = create_time_series_figure(
+                    merged, ts_col, selected_ts_cols,
+                    legend_position=legend_pos, legend_interactive=legend_click,
                 )
                 fig_ts.update_layout(title=title, xaxis_title=x_label, yaxis_title=y_label)
+                st.caption(
+                    "The chart and both downloads follow **Variables to plot** above."
+                )
                 source_ts = merged[[ts_col] + selected_ts_cols].copy()
                 _display_chart_with_downloads(
                     fig_ts, source_ts, key="eda_ts", filename_prefix="time_series",
@@ -2423,12 +2483,17 @@ def render_results():
                 ts_source = ts_source[(ts_source["timestamp"] >= start_ts) & (ts_source["timestamp"] < end_ts)]
             else:
                 start_ts = end_ts = None
-            fig_multi_ts = create_multi_model_timeseries(selected_results, prediction_scope=prediction_scope)
+            title, x_label, y_label = _chart_customization(
+                "res_multi_ts", "Multi-Model Time-Series Overlay", "Time", "Concentration",
+                legend=True,
+            )
+            legend_pos, legend_click = _legend_settings("res_multi_ts")
+            fig_multi_ts = create_multi_model_timeseries(
+                selected_results, prediction_scope=prediction_scope,
+                legend_position=legend_pos, legend_interactive=legend_click,
+            )
             if start_ts is not None and end_ts is not None:
                 fig_multi_ts.update_xaxes(range=[start_ts, end_ts])
-            title, x_label, y_label = _chart_customization(
-                "res_multi_ts", "Multi-Model Time-Series Overlay", "Time", "Concentration"
-            )
             fig_multi_ts.update_layout(title=title, xaxis_title=x_label, yaxis_title=y_label)
             _display_chart_with_downloads(
                 fig_multi_ts, ts_source if not ts_source.empty else None,
