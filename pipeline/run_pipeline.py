@@ -6,15 +6,12 @@ from the Streamlit UI or as a single end-to-end call.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-try:
-    import yaml
-except ImportError:  # pragma: no cover
-    yaml = None
+import pandas as pd
 
+from config.validation import load_config as _load_validated_config
 from evaluation.comparator import create_leaderboard, select_best_model
 from models.predict import predict_with_model
 from models.train import fitted_scaler, train_models
@@ -49,22 +46,12 @@ from modules.preprocessing import preprocess_dataset
 # -----------------------------------------------------------------------
 
 def load_config(config_path: str | Path) -> Dict[str, Any]:
-    """Load pipeline configuration from YAML or JSON."""
-    path = Path(config_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Config file not found: {path}")
+    """Load pipeline configuration from YAML or JSON.
 
-    if path.suffix.lower() in {".yaml", ".yml"}:
-        if yaml is None:
-            raise ImportError("PyYAML is required to read YAML configuration files.")
-        with path.open("r", encoding="utf-8") as f:
-            return yaml.safe_load(f)
-
-    if path.suffix.lower() == ".json":
-        with path.open("r", encoding="utf-8") as f:
-            return json.load(f)
-
-    raise ValueError("Config file must be YAML, YML, or JSON.")
+    Missing sections are filled from the packaged defaults and unusable values
+    are rejected by name, so a stage never meets a half-built config.
+    """
+    return _load_validated_config(config_path)
 
 
 # -----------------------------------------------------------------------
@@ -206,6 +193,82 @@ def run_eda_stage(
 
 
 # -----------------------------------------------------------------------
+# Diagnostics for an empty modelling frame
+# -----------------------------------------------------------------------
+
+def diagnose_empty_modelling_frame(
+    before: Any,
+    timestamp_column: str,
+    target_column: str,
+    config: Dict[str, Any],
+) -> str:
+    """Explain why feature engineering left no rows.
+
+    Every path here ends in ``dropna``, so an all-empty target, an empty
+    predictor column and over-long lag windows all produce the same result. The
+    message used to blame lag and rolling settings unconditionally, which sends
+    the user to adjust something irrelevant.
+    """
+    if target_column not in before.columns:
+        return (
+            f"Target column '{target_column}' is not in the aligned dataset. "
+            "Check the target column name on the Upload step, and that alignment produced it."
+        )
+
+    target = pd.to_numeric(before[target_column], errors="coerce")
+    if target.notna().sum() == 0:
+        return (
+            f"Target column '{target_column}' has no usable numeric values after alignment. "
+            "Check that the reference CSV's target column holds numbers, and that the two "
+            "datasets overlap in time."
+        )
+    if target.notna().sum() < 3:
+        return (
+            f"Only {int(target.notna().sum())} row(s) have a usable '{target_column}' value; "
+            "at least three are needed. Widen the date range or loosen the alignment settings."
+        )
+
+    predictors = [
+        c for c in before.select_dtypes(include="number").columns
+        if c not in (timestamp_column, target_column)
+    ]
+    empty_predictors = [c for c in predictors if before[c].notna().sum() == 0]
+    if empty_predictors and len(empty_predictors) == len(predictors):
+        return (
+            "Every predictor column is empty after alignment: "
+            + ", ".join(empty_predictors)
+            + ". Check that the sensor CSV holds numeric readings."
+        )
+    if empty_predictors:
+        return (
+            "These predictor columns are empty, and dropping incomplete rows removed "
+            "everything: " + ", ".join(empty_predictors)
+            + ". Deselect them on the Variable Selection step."
+        )
+
+    fe_cfg = config.get("feature_engineering", {})
+    lags = [int(s) for s in fe_cfg.get("lag_steps", []) or []]
+    windows = [int(w) for w in fe_cfg.get("rolling_windows", []) or []]
+    span = max([*lags, *windows], default=0)
+    if span >= len(before):
+        return (
+            f"The dataset has {len(before)} aligned rows but the largest lag/rolling "
+            f"window is {span}, which consumes all of them. Reduce them on the Feature "
+            "Engineering step."
+        )
+    if lags or windows:
+        return (
+            "Feature engineering removed all rows. Lag steps "
+            f"{lags or 'none'} and rolling windows {windows or 'none'} drop the leading "
+            f"rows of a {len(before)}-row dataset; reduce them on the Feature Engineering step."
+        )
+    return (
+        f"No complete rows remain from the {len(before)} aligned rows, and no lag or "
+        "rolling features are configured. Check for missing values in the selected columns."
+    )
+
+
+# -----------------------------------------------------------------------
 # Predictor selection
 # -----------------------------------------------------------------------
 
@@ -329,7 +392,9 @@ def run_modeling_stage(
         config=config["feature_engineering"],
     )
     if featured_df.empty:
-        raise ValueError("Feature engineering removed all rows. Adjust lag or rolling settings.")
+        raise ValueError(
+            diagnose_empty_modelling_frame(merged_df, ts_col, target_col, config)
+        )
 
     # Time features are ordinary numeric predictors and get scaled with the
     # rest, so they must be part of the frame before the preview is computed.

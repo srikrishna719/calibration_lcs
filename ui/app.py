@@ -67,6 +67,7 @@ from modules.drift_analysis import (
     create_residual_vs_predicted_figure,
 )
 from modules.download_helpers import render_chart_download, render_df_download
+from config.validation import load_config_text
 from modules.data_loader import summarize_duplicate_timestamps
 from modules.leakage import find_reference_encoding_columns, find_target_encoding_columns
 from modules.normalization import get_normalization_summary, normalize_dataset
@@ -741,12 +742,8 @@ def cached_load_sample():
 
 @st.cache_data(show_spinner=False)
 def cached_config_from_text(text: str, suffix: str):
-    if suffix in {".yaml", ".yml"}:
-        import yaml
-        return yaml.safe_load(text)
-    if suffix == ".json":
-        return json.loads(text)
-    raise ValueError("Config must be YAML or JSON.")
+    """Parse and validate an uploaded config, with any unknown-section warnings."""
+    return load_config_text(text, suffix)
 
 
 @st.cache_data(show_spinner=False)
@@ -991,11 +988,18 @@ def resolve_inputs(ref_file, sen_file, use_sample):
 
 
 def resolve_config(uploaded_file):
+    """Return a validated config, surfacing sections the pipeline will ignore."""
     if uploaded_file is None:
         return load_config(DEFAULT_CONFIG_PATH)
     suffix = Path(uploaded_file.name).suffix.lower()
     text = uploaded_file.getvalue().decode("utf-8")
-    return cached_config_from_text(text, suffix)
+    config, unknown = cached_config_from_text(text, suffix)
+    if unknown:
+        st.warning(
+            "These top-level sections are not read by the pipeline and will be "
+            "ignored — check for a typo: " + ", ".join(f"`{name}`" for name in unknown)
+        )
+    return config
 
 
 # ---------------------------------------------------------------------------
