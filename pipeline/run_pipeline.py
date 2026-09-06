@@ -216,6 +216,14 @@ def run_modeling_stage(
     if featured_df.empty:
         raise ValueError("Feature engineering removed all rows. Adjust lag or rolling settings.")
 
+    # Time features are ordinary numeric predictors and get scaled with the
+    # rest, so they must be part of the frame before the preview is computed.
+    featured_df = append_time_features(
+        dataframe=featured_df,
+        timestamp_column=ts_col,
+        config=config["feature_engineering"],
+    )
+
     # Normalization is applied *inside* each model (see build_estimator), so the
     # scaler is fit per training fold and ships with the exported model. The
     # frame handed to training therefore stays unscaled; what is computed here
@@ -235,12 +243,6 @@ def run_modeling_stage(
             ),
             "preview_only": True,
         }
-
-    featured_df = append_time_features(
-        dataframe=featured_df,
-        timestamp_column=ts_col,
-        config=config["feature_engineering"],
-    )
 
     results = train_models(
         dataframe=featured_df,

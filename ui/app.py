@@ -1764,7 +1764,13 @@ def render_feature_engineering():
 
     if advanced_mode:
         with st.expander("Advanced time features", expanded=False):
-            st.caption("Time features are appended after normalization so timestamp-derived columns are not scaled first.")
+            st.caption(
+                "Time features join the modelling matrix as ordinary numeric predictors and are "
+                "scaled with everything else by the model's own scaler. Absolute-time columns "
+                "(Unix timestamp, calendar date) let a model fit a trend over the deployment "
+                "period, which will not carry over to new data — prefer the cyclical encodings "
+                "unless you specifically want that trend."
+            )
             existing_tf = fe_config.get("time_feature_flags", {})
             add_time = st.checkbox(
                 "Enable time features",
@@ -1866,16 +1872,13 @@ def render_normalization():
     if st.button("\U0001f680 Apply Normalization", key="apply_normalization", width='stretch'):
         with st.spinner("Normalizing..."):
             try:
-                norm_cols = [c for c in featured.columns if c not in [ts_col, target_col]]
-                if method == "none":
-                    preview_base = featured.copy()
-                else:
-                    preview_base = normalize_dataset(featured.copy(), norm_cols, method)
-                summary = get_normalization_summary(featured, preview_base, norm_cols)
-
                 from modules.feature_engineering import append_time_features
                 time_cfg = config.get("feature_engineering", {})
-                # The modelling frame stays unscaled: train_models composes the
+                # Build the complete modelling matrix first, time features
+                # included. They are ordinary numeric predictors, so the model's
+                # scaler standardises them alongside everything else -- the
+                # preview below has to cover them or it misreports what happens.
+                # The frame itself stays unscaled: train_models composes the
                 # scaler into each estimator, so it is fit per training fold and
                 # travels with the model that gets exported.
                 modelling_dataset = append_time_features(
@@ -1883,12 +1886,14 @@ def render_normalization():
                     timestamp_column=ts_col,
                     config=time_cfg,
                 )
-                preview_dataset = append_time_features(
-                    dataframe=preview_base,
-                    timestamp_column=ts_col,
-                    config=time_cfg,
-                )
-                added_time_cols = [c for c in preview_dataset.columns if c not in preview_base.columns]
+                added_time_cols = [c for c in modelling_dataset.columns if c not in featured.columns]
+
+                norm_cols = [c for c in modelling_dataset.columns if c not in [ts_col, target_col]]
+                if method == "none":
+                    preview_dataset = modelling_dataset.copy()
+                else:
+                    preview_dataset = normalize_dataset(modelling_dataset.copy(), norm_cols, method)
+                summary = get_normalization_summary(modelling_dataset, preview_dataset, norm_cols)
 
                 st.session_state.normalization_outputs = {
                     "modelling_dataset": modelling_dataset,
@@ -1922,7 +1927,10 @@ def render_normalization():
 
         added_time_cols = norm_out.get("added_time_columns", [])
         if added_time_cols:
-            st.caption(f"Time features added after normalization: {', '.join(added_time_cols)}")
+            st.caption(
+                "Time features in the modelling matrix, scaled with every other predictor: "
+                + ", ".join(added_time_cols)
+            )
         st.markdown("#### Normalized dataset preview")
         if norm_out.get("method", "none") != "none":
             st.caption(

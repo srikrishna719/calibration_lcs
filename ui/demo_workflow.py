@@ -72,26 +72,23 @@ def build_sample_demo_state(
     )
 
     norm_method = str(config.get("normalization", {}).get("method", "none")).strip().lower()
-    norm_cols = [column for column in featured.columns if column not in [ts_col, target_col]]
-    if norm_method == "none":
-        preview_base = featured.copy()
-    else:
-        preview_base = normalize_dataset(featured.copy(), norm_cols, norm_method)
-    normalization_summary = get_normalization_summary(featured, preview_base, norm_cols)
 
     # Training gets the unscaled frame; the scaler is composed into each model
     # so it is fit per fold and exported with it. ``normalized`` is display only.
+    # Time features join the matrix first, because the model scales them too.
     modelling_dataset = append_time_features(
         dataframe=featured.copy(),
         timestamp_column=ts_col,
         config=feature_config,
     )
-    normalized = append_time_features(
-        dataframe=preview_base,
-        timestamp_column=ts_col,
-        config=feature_config,
-    )
-    added_time_columns = [column for column in normalized.columns if column not in preview_base.columns]
+    added_time_columns = [column for column in modelling_dataset.columns if column not in featured.columns]
+
+    norm_cols = [column for column in modelling_dataset.columns if column not in [ts_col, target_col]]
+    if norm_method == "none":
+        normalized = modelling_dataset.copy()
+    else:
+        normalized = normalize_dataset(modelling_dataset.copy(), norm_cols, norm_method)
+    normalization_summary = get_normalization_summary(modelling_dataset, normalized, norm_cols)
     modeling_outputs = train_on_prepared_dataset(
         modelling_dataset, target_col, config, normalization_method=norm_method
     )
