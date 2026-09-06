@@ -1,13 +1,13 @@
-"""Enhanced plotting utilities for calibration science.
+"""Plotting utilities for calibration science.
 
-Provides scatter plots with OLS fit and 1:1 reference lines,
-Bland-Altman agreement plots, multi-model comparison figures,
-and grouped metric bar charts.
+Scatter plots with OLS fit and 1:1 reference lines, multi-model comparison
+figures, grouped metric bar charts, and the residual diagnostics shown on the
+Residual Analysis step.
 """
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict
 
 import numpy as np
 import pandas as pd
@@ -126,58 +126,6 @@ def create_scatter_with_fit(
     )
     fig.update_xaxes(gridcolor="#e5e7eb", linecolor="#111827", zerolinecolor="#9ca3af")
     fig.update_yaxes(gridcolor="#e5e7eb", linecolor="#111827", zerolinecolor="#9ca3af")
-    return fig
-
-
-# ---------------------------------------------------------------------------
-# Bland-Altman agreement plot
-# ---------------------------------------------------------------------------
-
-def create_bland_altman_plot(
-    predictions_df: pd.DataFrame,
-    model_name: str = "",
-) -> go.Figure:
-    """Bland-Altman (Tukey mean-difference) agreement plot."""
-    actual = predictions_df["actual"].values.astype(float)
-    predicted = predictions_df["predicted"].values.astype(float)
-
-    mean_vals = (actual + predicted) / 2.0
-    diff_vals = predicted - actual
-    mean_diff = float(np.nanmean(diff_vals))
-    std_diff = float(np.nanstd(diff_vals, ddof=1))
-    loa_upper = mean_diff + 1.96 * std_diff
-    loa_lower = mean_diff - 1.96 * std_diff
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=mean_vals, y=diff_vals,
-        mode="markers",
-        name="Observations",
-        marker=dict(color="#8b5cf6", size=5, opacity=0.7),
-    ))
-    fig.add_hline(
-        y=mean_diff, line_color="#f59e0b", line_width=2,
-        annotation_text=f"Mean bias: {mean_diff:.3f}",
-        annotation_position="top right",
-    )
-    fig.add_hline(
-        y=loa_upper, line_color="#ef4444", line_dash="dash", line_width=1.5,
-        annotation_text=f"+1.96σ: {loa_upper:.3f}",
-        annotation_position="top right",
-    )
-    fig.add_hline(
-        y=loa_lower, line_color="#ef4444", line_dash="dash", line_width=1.5,
-        annotation_text=f"−1.96σ: {loa_lower:.3f}",
-        annotation_position="bottom right",
-    )
-
-    label = f" — {model_name}" if model_name else ""
-    fig.update_layout(
-        title=f"Bland-Altman Agreement Plot{label}",
-        xaxis_title="Mean of Actual & Predicted",
-        yaxis_title="Difference (Predicted − Actual)",
-        template="plotly_dark",
-    )
     return fig
 
 
@@ -340,4 +288,123 @@ def create_multi_model_metrics_bar(leaderboard: pd.DataFrame) -> go.Figure:
     )
     fig.update_annotations(font_size=12)
     fig.update_xaxes(tickangle=-30)
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Residual diagnostics (Residual Analysis step)
+# ---------------------------------------------------------------------------
+
+def create_residual_histogram(predictions_df: pd.DataFrame) -> go.Figure:
+    """Create a histogram of prediction residuals."""
+    residuals = predictions_df["predicted"] - predictions_df["actual"]
+    fig = px.histogram(
+        x=residuals,
+        nbins=30,
+        marginal="box",
+        title="Residual Distribution",
+        labels={"x": "Residual (Predicted − Actual)", "count": "Frequency"},
+        color_discrete_sequence=["#8b5cf6"],
+    )
+    fig.update_layout(template="plotly_dark")
+    return fig
+
+
+def create_qq_plot(predictions_df: pd.DataFrame) -> go.Figure:
+    """Create a QQ (Quantile-Quantile) plot of residuals against a normal distribution."""
+    try:
+        from scipy import stats as scipy_stats
+    except ImportError:
+        fig = go.Figure()
+        fig.add_annotation(text="scipy is required for QQ plots", showarrow=False)
+        fig.update_layout(template="plotly_dark", title="QQ Plot — Unavailable")
+        return fig
+
+    residuals = np.asarray(predictions_df["predicted"] - predictions_df["actual"], dtype=float)
+    residuals = residuals[np.isfinite(residuals)]
+
+    if len(residuals) < 3:
+        fig = go.Figure()
+        fig.add_annotation(text="Not enough data for QQ plot", showarrow=False)
+        fig.update_layout(template="plotly_dark", title="QQ Plot")
+        return fig
+
+    (osm, osr), (slope, intercept, _) = scipy_stats.probplot(residuals, dist="norm")
+    theoretical_line = slope * osm + intercept
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=osm, y=osr,
+        mode="markers",
+        name="Residuals",
+        marker=dict(color="#8b5cf6", size=5, opacity=0.7),
+    ))
+    fig.add_trace(go.Scatter(
+        x=osm, y=theoretical_line,
+        mode="lines",
+        name="Normal Reference",
+        line=dict(color="#f59e0b", dash="dash", width=2),
+    ))
+    fig.update_layout(
+        title="QQ Plot — Residuals vs Normal Distribution",
+        xaxis_title="Theoretical Quantiles",
+        yaxis_title="Sample Quantiles",
+        template="plotly_dark",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+    )
+    return fig
+
+
+def create_predicted_vs_actual_figure(predictions_df: pd.DataFrame) -> go.Figure:
+    """Scatter plot of predicted vs actual with a 1:1 reference line."""
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=predictions_df["actual"],
+            y=predictions_df["predicted"],
+            mode="markers",
+            name="Predictions",
+            marker=dict(color="#6366f1", size=5, opacity=0.7),
+        )
+    )
+    all_vals = pd.concat([predictions_df["actual"], predictions_df["predicted"]])
+    lo, hi = all_vals.min(), all_vals.max()
+    fig.add_trace(
+        go.Scatter(
+            x=[lo, hi],
+            y=[lo, hi],
+            mode="lines",
+            name="1:1 Line",
+            line=dict(color="#f59e0b", dash="dash", width=2),
+        )
+    )
+    fig.update_layout(
+        title="Predicted vs Actual",
+        xaxis_title="Actual (Reference)",
+        yaxis_title="Predicted (Calibrated)",
+        template="plotly_dark",
+    )
+    return fig
+
+
+def create_residual_vs_predicted_figure(predictions_df: pd.DataFrame) -> go.Figure:
+    """Residual vs predicted scatter."""
+    residuals = predictions_df["predicted"] - predictions_df["actual"]
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=predictions_df["predicted"],
+            y=residuals,
+            mode="markers",
+            name="Residuals",
+            marker=dict(color="#10b981", size=5, opacity=0.7),
+        )
+    )
+    fig.add_hline(y=0, line_dash="dash", line_color="#f59e0b", line_width=2)
+    fig.update_layout(
+        title="Residual Plot",
+        xaxis_title="Predicted Value",
+        yaxis_title="Residual (Predicted − Actual)",
+        template="plotly_dark",
+    )
     return fig

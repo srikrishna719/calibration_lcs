@@ -6,21 +6,17 @@ from the Streamlit UI or as a single end-to-end call.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-try:
-    import yaml
-except ImportError:  # pragma: no cover
-    yaml = None
+import pandas as pd
 
+from config.validation import load_config as _load_validated_config
 from evaluation.comparator import create_leaderboard, select_best_model
 from models.predict import predict_with_model
-from models.train import train_models
+from models.train import fitted_scaler, train_models
 from modules.alignment import align_and_merge_datasets
 from modules.data_loader import load_and_validate_dataset
-from modules.drift_analysis import generate_post_analysis_outputs
 from modules.eda import generate_eda_outputs
 from modules.exporter import (
     export_config_json_bytes,
@@ -35,6 +31,11 @@ from modules.exporter import (
     export_project_run_json_bytes,
 )
 from modules.feature_engineering import append_time_features, engineer_sensor_features
+from modules.leakage import (
+    LeakageReport,
+    find_reference_encoding_columns,
+    find_target_encoding_columns,
+)
 from modules.normalization import get_normalization_summary, normalize_dataset
 from modules.preprocessing import preprocess_dataset
 
@@ -44,22 +45,12 @@ from modules.preprocessing import preprocess_dataset
 # -----------------------------------------------------------------------
 
 def load_config(config_path: str | Path) -> Dict[str, Any]:
-    """Load pipeline configuration from YAML or JSON."""
-    path = Path(config_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Config file not found: {path}")
+    """Load pipeline configuration from YAML or JSON.
 
-    if path.suffix.lower() in {".yaml", ".yml"}:
-        if yaml is None:
-            raise ImportError("PyYAML is required to read YAML configuration files.")
-        with path.open("r", encoding="utf-8") as f:
-            return yaml.safe_load(f)
-
-    if path.suffix.lower() == ".json":
-        with path.open("r", encoding="utf-8") as f:
-            return json.load(f)
-
-    raise ValueError("Config file must be YAML, YML, or JSON.")
+    Missing sections are filled from the packaged defaults and unusable values
+    are rejected by name, so a stage never meets a half-built config.
+    """
+    return _load_validated_config(config_path)
 
 
 # -----------------------------------------------------------------------
@@ -75,22 +66,36 @@ def load_input_data(
     data_cfg = config["data"]
     ts_col = str(data_cfg["timestamp_column"])
     tz = str(data_cfg.get("timezone", "UTC"))
+    duplicate_strategy = str(data_cfg.get("duplicate_timestamps", "error"))
+    device_column = data_cfg.get("device_column") or None
 
-    reference_df = load_and_validate_dataset(
+    reference_df, reference_duplicates = load_and_validate_dataset(
         source=reference_source,
         timestamp_column=ts_col,
         dataset_name="Reference",
         timezone=tz,
+        duplicate_strategy=duplicate_strategy,
+        group_column=device_column,
+        group_value=data_cfg.get("reference_device") or None,
+        return_summary=True,
     )
-    sensor_df = load_and_validate_dataset(
+    sensor_df, sensor_duplicates = load_and_validate_dataset(
         source=sensor_source,
         timestamp_column=ts_col,
         dataset_name="LCS",
         timezone=tz,
+        duplicate_strategy=duplicate_strategy,
+        group_column=device_column,
+        group_value=data_cfg.get("sensor_device") or None,
+        return_summary=True,
     )
     return {
         "reference_raw": reference_df,
         "sensor_raw": sensor_df,
+        "duplicate_summary": {
+            "reference": reference_duplicates,
+            "sensor": sensor_duplicates,
+        },
     }
 
 
@@ -187,6 +192,174 @@ def run_eda_stage(
 
 
 # -----------------------------------------------------------------------
+# Diagnostics for an empty modelling frame
+# -----------------------------------------------------------------------
+
+def diagnose_empty_modelling_frame(
+    before: Any,
+    timestamp_column: str,
+    target_column: str,
+    config: Dict[str, Any],
+) -> str:
+    """Explain why feature engineering left no rows.
+
+    Every path here ends in ``dropna``, so an all-empty target, an empty
+    predictor column and over-long lag windows all produce the same result. The
+    message used to blame lag and rolling settings unconditionally, which sends
+    the user to adjust something irrelevant.
+    """
+    if target_column not in before.columns:
+        return (
+            f"Target column '{target_column}' is not in the aligned dataset. "
+            "Check the target column name on the Upload step, and that alignment produced it."
+        )
+
+    target = pd.to_numeric(before[target_column], errors="coerce")
+    if target.notna().sum() == 0:
+        return (
+            f"Target column '{target_column}' has no usable numeric values after alignment. "
+            "Check that the reference CSV's target column holds numbers, and that the two "
+            "datasets overlap in time."
+        )
+    if target.notna().sum() < 3:
+        return (
+            f"Only {int(target.notna().sum())} row(s) have a usable '{target_column}' value; "
+            "at least three are needed. Widen the date range or loosen the alignment settings."
+        )
+
+    predictors = [
+        c for c in before.select_dtypes(include="number").columns
+        if c not in (timestamp_column, target_column)
+    ]
+    empty_predictors = [c for c in predictors if before[c].notna().sum() == 0]
+    if empty_predictors and len(empty_predictors) == len(predictors):
+        return (
+            "Every predictor column is empty after alignment: "
+            + ", ".join(empty_predictors)
+            + ". Check that the sensor CSV holds numeric readings."
+        )
+    if empty_predictors:
+        return (
+            "These predictor columns are empty, and dropping incomplete rows removed "
+            "everything: " + ", ".join(empty_predictors)
+            + ". Deselect them on the Variable Selection step."
+        )
+
+    fe_cfg = config.get("feature_engineering", {})
+    lags = [int(s) for s in fe_cfg.get("lag_steps", []) or []]
+    windows = [int(w) for w in fe_cfg.get("rolling_windows", []) or []]
+    span = max([*lags, *windows], default=0)
+    if span >= len(before):
+        return (
+            f"The dataset has {len(before)} aligned rows but the largest lag/rolling "
+            f"window is {span}, which consumes all of them. Reduce them on the Feature "
+            "Engineering step."
+        )
+    if lags or windows:
+        return (
+            "Feature engineering removed all rows. Lag steps "
+            f"{lags or 'none'} and rolling windows {windows or 'none'} drop the leading "
+            f"rows of a {len(before)}-row dataset; reduce them on the Feature Engineering step."
+        )
+    return (
+        f"No complete rows remain from the {len(before)} aligned rows, and no lag or "
+        "rolling features are configured. Check for missing values in the selected columns."
+    )
+
+
+# -----------------------------------------------------------------------
+# Predictor selection
+# -----------------------------------------------------------------------
+
+def screen_leaking_columns(
+    dataframe: Any,
+    timestamp_column: str,
+    target_column: str,
+    config: Dict[str, Any],
+) -> tuple[Any, "LeakageReport"]:
+    """Drop predictors that carry the target or a reference reading.
+
+    Two scans, both before anything derives from these columns: a leaking base
+    column would otherwise spawn leaking lag, rolling and interaction columns,
+    and the pairwise scan does not scale to a wide engineered frame anyway.
+
+    The first finds columns reconstructing the target, which make the model
+    score perfectly while learning nothing
+    (``training.include_target_encoding_predictors`` keeps them). The second
+    finds columns reconstructing a reference channel -- a
+    ``sensor_x - reference_x`` difference for some other variable, which is not
+    target leakage but still needs a reading a deployed sensor does not have
+    (``training.include_reference_predictors`` keeps them, the same switch that
+    governs the reference columns themselves).
+    """
+    training_cfg = config.get("training", {})
+    data_cfg = config.get("data", {})
+    reference_prefix = str(data_cfg.get("reference_prefix", "reference"))
+
+    numeric = [
+        c for c in dataframe.select_dtypes(include="number").columns
+        if c not in (timestamp_column, target_column)
+    ]
+    combined = LeakageReport()
+
+    if not bool(training_cfg.get("include_target_encoding_predictors", False)):
+        combined = find_target_encoding_columns(dataframe, target_column, numeric)
+
+    if not bool(training_cfg.get("include_reference_predictors", False)):
+        reference_columns = [
+            c for c in dataframe.select_dtypes(include="number").columns
+            if str(c).startswith(f"{reference_prefix}_") and c != target_column
+        ]
+        remaining = [c for c in numeric if c not in combined.excluded]
+        if reference_columns and remaining:
+            reference_report = find_reference_encoding_columns(
+                dataframe, reference_columns, remaining
+            )
+            for name in reference_report.excluded:
+                # Reference channels are dropped later by deployable_feature_subset;
+                # what matters here is the derived columns that hide them.
+                if name.startswith(f"{reference_prefix}_") or name in combined.reasons:
+                    continue
+                combined.excluded.append(name)
+                combined.reasons[name] = reference_report.reasons[name]
+            combined.exact_pairs.extend(reference_report.exact_pairs)
+
+    if not combined.excluded:
+        return dataframe, combined
+    return dataframe.drop(columns=combined.excluded, errors="ignore"), combined
+
+
+def deployable_feature_subset(
+    dataframe: Any,
+    timestamp_column: str,
+    target_column: str,
+    config: Dict[str, Any],
+) -> Optional[List[str]]:
+    """Numeric feature columns a deployed sensor could actually supply.
+
+    Columns carrying the reference prefix are measurements from the instrument
+    being calibrated *against*. A model that depends on them cannot be applied
+    to a sensor running on its own, and its metrics flatter what a deployable
+    calibration would achieve, so they are excluded by default. Set
+    ``training.include_reference_predictors`` to keep them for a co-location
+    study where that is the intent.
+
+    Returns ``None`` when every feature should be used, which is the signal
+    ``train_models`` expects for "no subset".
+    """
+    if bool(config.get("training", {}).get("include_reference_predictors", False)):
+        return None
+
+    reference_prefix = str(config["data"].get("reference_prefix", "reference"))
+    numeric = dataframe.select_dtypes(include="number").columns.tolist()
+    candidates = [c for c in numeric if c not in (timestamp_column, target_column)]
+    deployable = [c for c in candidates if not str(c).startswith(f"{reference_prefix}_")]
+
+    # Nothing left to model with — fall back rather than fail.
+    return deployable or None
+
+
+# -----------------------------------------------------------------------
 # Stage 5 — Feature Engineering + Modelling
 # -----------------------------------------------------------------------
 
@@ -207,40 +380,57 @@ def run_modeling_stage(
     ts_col = str(data_cfg["timestamp_column"])
     target_col = f"{data_cfg['reference_prefix']}_{data_cfg['target_column']}"
 
+    merged_df, leakage_report = screen_leaking_columns(
+        merged_df, ts_col, target_col, config
+    )
+
     featured_df = engineer_sensor_features(
         dataframe=merged_df,
         timestamp_column=ts_col,
         target_column=target_col,
         config=config["feature_engineering"],
+        sensor_prefix=str(data_cfg.get("sensor_prefix", "sensor")),
     )
     if featured_df.empty:
-        raise ValueError("Feature engineering removed all rows. Adjust lag or rolling settings.")
-
-    # Apply normalization if configured.
-    norm_cfg = config.get("normalization", {})
-    norm_method = str(norm_cfg.get("method", "none"))
-    scaler = None
-    normalization_outputs = None
-    if norm_method.strip().lower() != "none":
-        norm_cols = [c for c in featured_df.columns if c not in [ts_col, target_col]]
-        before_norm = featured_df.copy()
-        featured_df, scaler = normalize_dataset(
-            featured_df,
-            norm_cols,
-            norm_method,
-            return_scaler=True,
+        raise ValueError(
+            diagnose_empty_modelling_frame(merged_df, ts_col, target_col, config)
         )
-        normalization_outputs = {
-            "method": norm_method,
-            "columns": norm_cols,
-            "summary": get_normalization_summary(before_norm, featured_df, norm_cols),
-        }
 
+    # Time features are ordinary numeric predictors and get scaled with the
+    # rest, so they must be part of the frame before the preview is computed.
     featured_df = append_time_features(
         dataframe=featured_df,
         timestamp_column=ts_col,
         config=config["feature_engineering"],
     )
+
+    # Settle the predictor set before previewing, so the preview describes the
+    # columns the model will actually scale and nothing else.
+    if feature_subset is None:
+        feature_subset = deployable_feature_subset(featured_df, ts_col, target_col, config)
+
+    # Normalization is applied *inside* each model (see build_estimator), so the
+    # scaler is fit per training fold and ships with the exported model. The
+    # frame handed to training therefore stays unscaled; what is computed here
+    # is a descriptive preview of what that scaling does.
+    norm_cfg = config.get("normalization", {})
+    norm_method = str(norm_cfg.get("method", "none"))
+    normalization_outputs = None
+    if norm_method.strip().lower() != "none":
+        norm_cols = feature_subset or [
+            c for c in featured_df.select_dtypes(include="number").columns
+            if c not in [ts_col, target_col]
+        ]
+        normalization_outputs = {
+            "method": norm_method,
+            "columns": norm_cols,
+            "summary": get_normalization_summary(
+                featured_df,
+                normalize_dataset(featured_df, norm_cols, norm_method),
+                norm_cols,
+            ),
+            "preview_only": True,
+        }
 
     results = train_models(
         dataframe=featured_df,
@@ -249,6 +439,7 @@ def run_modeling_stage(
         config=config["training"],
         random_state=int(config.get("app", {}).get("random_state", 42)),
         feature_subset=feature_subset,
+        normalization_method=norm_method,
     )
     leaderboard = create_leaderboard(results, config["evaluation"])
     best = select_best_model(results, leaderboard)
@@ -258,6 +449,7 @@ def run_modeling_stage(
         dataframe=featured_df,
         target_column=target_col,
         timestamp_column=ts_col,
+        feature_names=best.feature_names,
     )
     calibrated = (
         featured_df[[ts_col, target_col]]
@@ -274,8 +466,9 @@ def run_modeling_stage(
         "best_model": best.model,
         "best_model_metrics": best.metrics,
         "calibrated_dataset": calibrated,
-        "scaler": scaler,
+        "scaler": fitted_scaler(best.model),
         "normalization_outputs": normalization_outputs,
+        "leakage_report": leakage_report,
     }
 
 
@@ -284,6 +477,7 @@ def train_on_prepared_dataset(
     target_column: str,
     config: Dict[str, Any],
     feature_subset: list | None = None,
+    normalization_method: str | None = None,
 ) -> Dict[str, Any]:
     """Train models on an already-prepared dataset.
 
@@ -304,6 +498,10 @@ def train_on_prepared_dataset(
         Pipeline configuration dict.
     feature_subset:
         Optional list of feature columns to restrict training.
+    normalization_method:
+        Scaler to compose into each model. ``prepared_df`` must be unscaled —
+        the scaler is fit per training fold and stored inside the fitted model.
+        Defaults to ``config["normalization"]["method"]``.
 
     Returns
     -------
@@ -311,6 +509,8 @@ def train_on_prepared_dataset(
         Same keys as :func:`run_modeling_stage`.
     """
     ts_col = str(config["data"]["timestamp_column"])
+    if normalization_method is None:
+        normalization_method = str(config.get("normalization", {}).get("method", "none"))
 
     if prepared_df is None or len(prepared_df) == 0:
         raise ValueError("Prepared dataset is empty. Revisit the preparation steps.")
@@ -326,6 +526,7 @@ def train_on_prepared_dataset(
         config=config["training"],
         random_state=int(config.get("app", {}).get("random_state", 42)),
         feature_subset=feature_subset,
+        normalization_method=normalization_method,
     )
     leaderboard = create_leaderboard(results, config["evaluation"])
     best = select_best_model(results, leaderboard)
@@ -335,6 +536,7 @@ def train_on_prepared_dataset(
         dataframe=prepared_df,
         target_column=target_column,
         timestamp_column=ts_col,
+        feature_names=best.feature_names,
     )
     calibrated = (
         prepared_df[[ts_col, target_column]]
@@ -351,32 +553,13 @@ def train_on_prepared_dataset(
         "best_model": best.model,
         "best_model_metrics": best.metrics,
         "calibrated_dataset": calibrated,
-        "scaler": None,
+        "scaler": fitted_scaler(best.model),
         "normalization_outputs": None,
     }
 
 
 # -----------------------------------------------------------------------
-# Stage 6 — Post-Calibration Analysis
-# -----------------------------------------------------------------------
-
-def run_post_analysis_stage(
-    predictions_df: Any,
-    config: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Run drift detection and residual analysis."""
-    drift_cfg = config.get("drift_analysis", {})
-    rolling_window = int(drift_cfg.get("rolling_window", 6))
-    drift_threshold = float(drift_cfg.get("drift_threshold", 1.5))
-    return generate_post_analysis_outputs(
-        predictions_df,
-        rolling_window=rolling_window,
-        drift_threshold=drift_threshold,
-    )
-
-
-# -----------------------------------------------------------------------
-# Stage 7 — Export
+# Stage 6 — Export
 # -----------------------------------------------------------------------
 
 def build_export_bundle(
@@ -475,7 +658,6 @@ def run_full_pipeline(
     modeling = run_modeling_stage(alignment["merged_data"], config)
 
     best_result = modeling["training_results"][modeling["best_model_name"]]
-    post = run_post_analysis_stage(best_result.full_predictions, config)
 
     export = build_export_bundle(
         calibrated_dataset=modeling["calibrated_dataset"],
@@ -494,6 +676,5 @@ def run_full_pipeline(
         **alignment,
         **eda,
         **modeling,
-        **post,
         **export,
     }

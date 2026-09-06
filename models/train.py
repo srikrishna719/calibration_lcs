@@ -12,12 +12,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from sklearn.base import RegressorMixin
+from sklearn.base import BaseEstimator, RegressorMixin, clone
 from sklearn.model_selection import KFold, RandomizedSearchCV, TimeSeriesSplit
+from sklearn.pipeline import Pipeline
 
 from evaluation.metrics import calculate_regression_metrics
 from models.model_registry import get_selected_models
 from modules.diagnostics import compute_coefficient_table
+from modules.normalization import build_scaler
 
 try:
     import statsmodels.api as sm
@@ -60,29 +62,53 @@ _PARAM_GRIDS: Dict[str, Dict[str, list]] = {
 STATSMODELS_LINEAR_MODELS = {"ols_regression", "multiple_linear_regression"}
 
 
-class StatsmodelsOLSRegressor:
-    """Small sklearn-like wrapper around statsmodels OLS results."""
+class StatsmodelsOLSRegressor(RegressorMixin, BaseEstimator):
+    """Small sklearn-compatible wrapper around statsmodels OLS results.
+
+    Subclasses the sklearn base classes (rather than only duck-typing them) so
+    the wrapper can be composed into a ``Pipeline`` alongside a scaler, which
+    is how normalization is applied. ``BaseEstimator`` supplies get_params /
+    set_params / ``__sklearn_tags__``; only the fitted-state check needs a hand,
+    because the trailing-underscore attributes exist before ``fit``.
+    """
 
     def __init__(self) -> None:
         self.result_: Any = None
         self.feature_names_: List[str] = []
         self.design_columns_: List[str] = []
 
-    def get_params(self, deep: bool = True) -> Dict[str, object]:
-        return {}
-
-    def set_params(self, **params: object) -> "StatsmodelsOLSRegressor":
-        return self
+    def __sklearn_is_fitted__(self) -> bool:
+        return self.result_ is not None
 
     def _prepare_design(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Reorder ``X`` into the design matrix this model was fitted on.
+
+        Extra columns are ignored, but a feature the model was fitted on must
+        actually be supplied. Substituting zeros for a missing predictor would
+        silently return plausible-looking predictions from a different model
+        than the one that was fitted.
+        """
         X_df = pd.DataFrame(X).copy()
         if self.feature_names_:
-            X_df = X_df.reindex(columns=self.feature_names_, fill_value=0)
+            available = {str(column): column for column in X_df.columns}
+            missing = [name for name in self.feature_names_ if name not in available]
+            if missing:
+                raise ValueError(
+                    "Design matrix is missing feature column(s) the model was fitted on: "
+                    + ", ".join(missing)
+                )
+            X_df = X_df[[available[name] for name in self.feature_names_]]
+            X_df.columns = list(self.feature_names_)
+
         design = sm.add_constant(X_df, has_constant="add")
-        for column in self.design_columns_:
-            if column not in design.columns:
-                design[column] = 1.0 if column == "const" else 0.0
         if self.design_columns_:
+            missing_design = [
+                column for column in self.design_columns_ if column not in design.columns
+            ]
+            if missing_design:
+                raise ValueError(
+                    "Design matrix is missing fitted term(s): " + ", ".join(missing_design)
+                )
             design = design[self.design_columns_]
         return design
 
@@ -117,6 +143,53 @@ class StatsmodelsOLSRegressor:
 
 
 # ---------------------------------------------------------------------------
+# Estimator construction — scaling belongs inside the model
+# ---------------------------------------------------------------------------
+
+MODEL_STEP = "model"
+SCALER_STEP = "scaler"
+
+
+def build_estimator(
+    model: RegressorMixin | StatsmodelsOLSRegressor,
+    normalization_method: str = "none",
+) -> RegressorMixin | StatsmodelsOLSRegressor | Pipeline:
+    """Compose ``model`` with a scaler when normalization is requested.
+
+    Scaling is part of the estimator rather than a prior transform of the whole
+    dataset. Two things follow, and both matter:
+
+    * The scaler is re-fit on each training fold, so validation statistics
+      never leak into the fit that produces the reported metrics.
+    * The exported pickle carries the scaler, so the model can be applied to
+      raw sensor readings instead of silently requiring the caller to
+      reproduce an unavailable transform.
+    """
+    scaler = build_scaler(normalization_method)
+    if scaler is None:
+        return model
+    return Pipeline([(SCALER_STEP, scaler), (MODEL_STEP, model)])
+
+
+def final_estimator(
+    estimator: RegressorMixin | StatsmodelsOLSRegressor | Pipeline,
+) -> RegressorMixin | StatsmodelsOLSRegressor:
+    """Return the regressor itself, unwrapping a scaling pipeline if present."""
+    if isinstance(estimator, Pipeline):
+        return estimator.named_steps[MODEL_STEP]
+    return estimator
+
+
+def fitted_scaler(
+    estimator: RegressorMixin | StatsmodelsOLSRegressor | Pipeline,
+) -> object | None:
+    """Return the fitted scaler from a pipeline, or ``None`` when unscaled."""
+    if isinstance(estimator, Pipeline):
+        return estimator.named_steps.get(SCALER_STEP)
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Data class
 # ---------------------------------------------------------------------------
 
@@ -140,7 +213,13 @@ class TrainingResult:
     coefficient_table: Optional[pd.DataFrame] = None
     validation_method: str = "timeseriessplit"
     validation_predictions: Optional[pd.DataFrame] = None
+    # predicted - actual, the convention used throughout evaluation and plots.
     residuals: Optional[pd.Series] = None
+    # Parameters chosen inside each outer fold when tuning ran under nested CV.
+    # ``best_params`` is the final search over all rows; these show its stability.
+    nested_best_params: Optional[List[Dict[str, Any]]] = None
+    # Scaler composed into ``model``; "none" when the model takes raw features.
+    normalization_method: str = "none"
 
 
 # ---------------------------------------------------------------------------
@@ -200,8 +279,11 @@ def prepare_training_matrices(
     Parameters
     ----------
     feature_subset:
-        If provided, only these columns are used as features.
-        Must all be present in dataframe (after dropping target/timestamp).
+        If provided, only these columns are used as features, in the order
+        given. Every name must resolve to a numeric column of ``dataframe``;
+        anything missing or non-numeric raises rather than being dropped, so a
+        stale or mistyped selection cannot silently train on other features.
+        Pass ``None`` (or an empty list) to use every numeric column.
     """
     ordered = dataframe.sort_values(timestamp_column).reset_index(drop=True)
     if target_column not in ordered.columns:
@@ -216,9 +298,26 @@ def prepare_training_matrices(
     )
 
     if feature_subset:
-        valid_subset = [c for c in feature_subset if c in features.columns]
-        if valid_subset:
-            features = features[valid_subset]
+        requested = [str(column) for column in feature_subset]
+        missing = [column for column in requested if column not in features.columns]
+        if missing:
+            unknown = [column for column in missing if column not in ordered.columns]
+            non_numeric = [column for column in missing if column in ordered.columns]
+            details = []
+            if unknown:
+                details.append(
+                    "not found in the modelling dataset: " + ", ".join(unknown)
+                )
+            if non_numeric:
+                details.append(
+                    "present but not numeric: " + ", ".join(non_numeric)
+                )
+            raise ValueError(
+                "Selected feature column(s) cannot be used for training: "
+                + "; ".join(details)
+                + ". Revisit the Feature Subset selection."
+            )
+        features = features[requested]
 
     modelling_matrix = features.copy()
     modelling_matrix[target_column] = target
@@ -274,11 +373,13 @@ def _safe_folds(n_samples: int, requested_folds: int) -> int:
     return max(2, min(int(requested_folds), n_samples - 1))
 
 
-def _clone_model(model: RegressorMixin | StatsmodelsOLSRegressor) -> RegressorMixin | StatsmodelsOLSRegressor:
-    """Clone sklearn or local statsmodels-wrapper estimators."""
-    if isinstance(model, StatsmodelsOLSRegressor):
-        return StatsmodelsOLSRegressor()
-    return model.__class__(**model.get_params())
+def _clone_model(model: RegressorMixin | StatsmodelsOLSRegressor | Pipeline):
+    """Return an unfitted copy of an estimator, pipeline included.
+
+    ``sklearn.base.clone`` walks a Pipeline's steps, so the scaler is cloned
+    unfitted alongside the regressor and re-fit on each fold's training rows.
+    """
+    return clone(model)
 
 
 def _make_cv_splitter(method: str, n_samples: int, folds: int, random_state: int):
@@ -330,6 +431,10 @@ def tune_hyperparameters(
         model.fit(x_train, y_train)
         return model, {}
 
+    if isinstance(model, Pipeline):
+        # Address the regressor's params through the pipeline step name.
+        param_grid = {f"{MODEL_STEP}__{key}": values for key, values in param_grid.items()}
+
     cv = _make_cv_splitter(validation_method, len(x_train), cv_folds, random_state)
     search = RandomizedSearchCV(
         estimator=model,
@@ -342,7 +447,11 @@ def tune_hyperparameters(
         refit=True,
     )
     search.fit(x_train, y_train)
-    return search.best_estimator_, dict(search.best_params_)
+    best_params = {
+        key.split("__", 1)[-1] if key.startswith(f"{MODEL_STEP}__") else key: value
+        for key, value in search.best_params_.items()
+    }
+    return search.best_estimator_, best_params
 
 
 # ---------------------------------------------------------------------------
@@ -357,14 +466,50 @@ def generate_validation_predictions(
     folds: int,
     method: str,
     random_state: int,
-) -> pd.DataFrame:
-    """Generate out-of-fold predictions using the requested validation strategy."""
+    tuning: Optional[Dict[str, Any]] = None,
+) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
+    """Generate out-of-fold predictions using the requested validation strategy.
+
+    Parameters
+    ----------
+    tuning:
+        When given (``{"model_name": ..., "n_iter": ...}``), hyperparameters are
+        searched *within each outer training fold* rather than once beforehand.
+        This nesting is what keeps the returned predictions honest: the
+        parameters used to predict a fold were chosen without ever seeing it. A
+        single search up front would select parameters using rows that later
+        appear in the folds being scored, quietly flattering every metric.
+
+    Returns
+    -------
+    Tuple[pd.DataFrame, List[Dict[str, Any]]]
+        Out-of-fold predictions, and the parameters chosen per fold (empty when
+        no tuning was requested). Divergent per-fold parameters are a useful
+        signal that the search is unstable on this dataset.
+    """
     splitter = _make_cv_splitter(method, len(features), folds, random_state)
     predictions: List[pd.DataFrame] = []
+    fold_params: List[Dict[str, Any]] = []
 
     for train_idx, test_idx in splitter.split(features):
         fold_model = _clone_model(model)
-        fold_model.fit(features.iloc[train_idx], target.iloc[train_idx])
+        x_fold, y_fold = features.iloc[train_idx], target.iloc[train_idx]
+
+        if tuning:
+            fold_model, chosen = tune_hyperparameters(
+                model_name=str(tuning["model_name"]),
+                model=fold_model,
+                x_train=x_fold,
+                y_train=y_fold,
+                n_iter=int(tuning["n_iter"]),
+                cv_folds=folds,
+                random_state=random_state,
+                validation_method=method,
+            )
+            fold_params.append(chosen)
+        else:
+            fold_model.fit(x_fold, y_fold)
+
         fold_preds = fold_model.predict(features.iloc[test_idx])
         predictions.append(pd.DataFrame({
             "timestamp": timestamps.iloc[test_idx].values,
@@ -373,9 +518,10 @@ def generate_validation_predictions(
         }))
 
     if not predictions:
-        return pd.DataFrame(columns=["timestamp", "actual", "predicted"])
+        return pd.DataFrame(columns=["timestamp", "actual", "predicted"]), fold_params
 
-    return pd.concat(predictions, ignore_index=True).sort_values("timestamp").reset_index(drop=True)
+    combined = pd.concat(predictions, ignore_index=True).sort_values("timestamp").reset_index(drop=True)
+    return combined, fold_params
 
 
 
@@ -390,6 +536,7 @@ def train_models(
     config: Dict[str, object],
     random_state: int = 42,
     feature_subset: Optional[List[str]] = None,
+    normalization_method: str = "none",
 ) -> List[TrainingResult]:
     """Train all configured models and collect evaluation outputs.
 
@@ -407,6 +554,11 @@ def train_models(
         Random seed for reproducibility.
     feature_subset:
         Optional list of feature column names to use (overrides all features).
+    normalization_method:
+        Scaler to compose into each model ("none", "standard", "minmax",
+        "robust"). Pass the *unscaled* dataframe together with this argument
+        rather than pre-scaling: the scaler is then fit per training fold, and
+        it is stored inside the fitted model so exports work on raw data.
 
     Returns
     -------
@@ -437,24 +589,35 @@ def train_models(
         if model_name in STATSMODELS_LINEAR_MODELS:
             model = StatsmodelsOLSRegressor()
 
-        # --- optional tuning ---
+        # Scaling travels with the estimator: fit per fold, exported with the model.
+        model = build_estimator(model, normalization_method)
+
+        # --- tuning configuration ---
         model_tune = tuning_cfg.get(model_name, {})
-        if model_tune.get("enabled", False) and model_name not in STATSMODELS_LINEAR_MODELS:
-            n_iter = int(model_tune.get("n_iter", 10))
-            model, best_params = tune_hyperparameters(
-                model_name=model_name,
-                model=model,
-                x_train=x_train,
-                y_train=y_train,
-                n_iter=n_iter,
-                cv_folds=folds,
-                random_state=random_state,
-                validation_method=validation_method,
-            )
+        tune_enabled = (
+            bool(model_tune.get("enabled", False))
+            and model_name not in STATSMODELS_LINEAR_MODELS
+        )
+        n_iter = int(model_tune.get("n_iter", 10))
+        nested_best_params: List[Dict[str, Any]] = []
 
         # --- validation predictions and metrics ---
         if validation_method == "holdout":
-            model.fit(x_train, y_train)
+            # The search only ever sees the chronological training split, and
+            # metrics come from the held-out tail, so one search is enough here.
+            if tune_enabled:
+                model, best_params = tune_hyperparameters(
+                    model_name=model_name,
+                    model=model,
+                    x_train=x_train,
+                    y_train=y_train,
+                    n_iter=n_iter,
+                    cv_folds=folds,
+                    random_state=random_state,
+                    validation_method=validation_method,
+                )
+            else:
+                model.fit(x_train, y_train)
             test_preds = model.predict(x_test)
             validation_pred_df = pd.DataFrame({
                 "timestamp": ts_test.values,
@@ -466,7 +629,10 @@ def train_models(
                 y_pred=pd.Series(test_preds, index=y_test.index),
             )
         else:
-            validation_pred_df = generate_validation_predictions(
+            # Metrics come from every row, so tuning has to happen inside each
+            # fold. Searching once beforehand would pick parameters using rows
+            # that are later scored as validation data.
+            validation_pred_df, nested_best_params = generate_validation_predictions(
                 model=model,
                 features=features,
                 target=target,
@@ -474,12 +640,28 @@ def train_models(
                 folds=folds,
                 method=validation_method,
                 random_state=random_state,
+                tuning={"model_name": model_name, "n_iter": n_iter} if tune_enabled else None,
             )
             metrics = calculate_regression_metrics(
                 y_true=validation_pred_df["actual"],
                 y_pred=validation_pred_df["predicted"],
             )
-            model.fit(features, target)
+            # The exported model is tuned and fitted on everything. The metrics
+            # above were produced by the nested procedure, so this final search
+            # cannot feed back into them.
+            if tune_enabled:
+                model, best_params = tune_hyperparameters(
+                    model_name=model_name,
+                    model=model,
+                    x_train=features,
+                    y_train=target,
+                    n_iter=n_iter,
+                    cv_folds=folds,
+                    random_state=random_state,
+                    validation_method=validation_method,
+                )
+            else:
+                model.fit(features, target)
 
         metrics["validation_method"] = validation_method
 
@@ -489,13 +671,14 @@ def train_models(
             "predicted": model.predict(features),
         })
 
-        importance, coefs, intercept = extract_feature_importance(model, feature_names)
+        regressor = final_estimator(model)
+        importance, coefs, intercept = extract_feature_importance(regressor, feature_names)
         coefficient_table = None
         standard_errors = None
         t_statistics = None
         p_values = None
-        if isinstance(model, StatsmodelsOLSRegressor) and model.result_ is not None:
-            coefficient_table = compute_coefficient_table(model.result_)
+        if isinstance(regressor, StatsmodelsOLSRegressor) and regressor.result_ is not None:
+            coefficient_table = compute_coefficient_table(regressor.result_)
             if coefficient_table is not None and not coefficient_table.empty:
                 standard_errors = dict(zip(
                     coefficient_table["Variable"].astype(str),
@@ -510,9 +693,13 @@ def train_models(
                     coefficient_table["p-value"].astype(float),
                 ))
 
+        # predicted - actual, matching evaluation.metrics.bias, the drift
+        # analysis and every residual plot. The opposite convention here made
+        # TrainingResult.residuals disagree in sign with everything that
+        # consumed it.
         residuals = pd.Series(
-            np.asarray(validation_pred_df["actual"], dtype=float)
-            - np.asarray(validation_pred_df["predicted"], dtype=float)
+            np.asarray(validation_pred_df["predicted"], dtype=float)
+            - np.asarray(validation_pred_df["actual"], dtype=float)
         )
 
         results.append(TrainingResult(
@@ -533,6 +720,8 @@ def train_models(
             validation_method=validation_method,
             validation_predictions=validation_pred_df.reset_index(drop=True),
             residuals=residuals,
+            normalization_method=normalization_method,
+            nested_best_params=nested_best_params or None,
         ))
 
     return results

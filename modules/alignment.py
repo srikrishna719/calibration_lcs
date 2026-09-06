@@ -12,6 +12,19 @@ import numpy as np
 import pandas as pd
 
 
+def non_numeric_columns(
+    dataframe: pd.DataFrame,
+    timestamp_column: str,
+) -> List[str]:
+    """Return the columns that cannot be aggregated during resampling."""
+    numeric = set(dataframe.select_dtypes(include=[np.number]).columns.tolist())
+    return [
+        str(column)
+        for column in dataframe.columns
+        if column != timestamp_column and column not in numeric
+    ]
+
+
 def resample_timeseries(
     dataframe: pd.DataFrame,
     timestamp_column: str,
@@ -19,6 +32,11 @@ def resample_timeseries(
     aggregation: str = "mean",
 ) -> pd.DataFrame:
     """Resample a time series dataset by timestamp.
+
+    Only numeric columns are aggregated. Text columns (site IDs, station names,
+    QA flags) are dropped rather than passed to the aggregation function, which
+    would otherwise raise an opaque pandas TypeError. Use
+    :func:`non_numeric_columns` to report what will be dropped.
 
     Parameters
     ----------
@@ -34,12 +52,25 @@ def resample_timeseries(
     Returns
     -------
     pd.DataFrame
-        Resampled dataset.
+        Resampled dataset containing the timestamp and numeric columns only.
     """
     df = dataframe.copy()
     df[timestamp_column] = pd.to_datetime(df[timestamp_column])
+
+    numeric_cols = [
+        str(column)
+        for column in df.select_dtypes(include=[np.number]).columns
+        if column != timestamp_column
+    ]
+    if not numeric_cols:
+        raise ValueError(
+            "Dataset has no numeric columns to resample. "
+            "Check that measurement columns were parsed as numbers, not text."
+        )
+
     return (
-        df.set_index(timestamp_column)
+        df[[timestamp_column, *numeric_cols]]
+        .set_index(timestamp_column)
         .resample(rule.strip())
         .agg(aggregation)
         .dropna(how="all")
@@ -77,16 +108,26 @@ def detect_optimal_lag(
     int
         Optimal lag in timesteps.  Positive = sensor leads.
     """
-    merged = reference_df[[timestamp_column, reference_target_column]].merge(
-        sensor_df[[timestamp_column, sensor_feature_column]],
-        on=timestamp_column,
-        how="inner",
-    ).dropna()
+    # Rename before merging: the reference target and the sensor channel are
+    # very often both called e.g. "pm25", and pandas would then suffix them to
+    # pm25_x / pm25_y, so looking them up by their original names would fail.
+    reference_series_name, sensor_series_name = "_reference_series", "_sensor_series"
+    merged = (
+        reference_df[[timestamp_column, reference_target_column]]
+        .rename(columns={reference_target_column: reference_series_name})
+        .merge(
+            sensor_df[[timestamp_column, sensor_feature_column]]
+            .rename(columns={sensor_feature_column: sensor_series_name}),
+            on=timestamp_column,
+            how="inner",
+        )
+        .dropna()
+    )
     if merged.empty:
         return 0
 
-    ref_series = merged[reference_target_column]
-    sen_series = merged[sensor_feature_column]
+    ref_series = merged[reference_series_name]
+    sen_series = merged[sensor_series_name]
     best_lag = 0
     best_score = -np.inf
 
@@ -152,6 +193,11 @@ def align_and_merge_datasets(
     rule = str(config.get("resample_rule", "1h"))
     aggregation = str(config.get("aggregation", "mean"))
     merge_strategy = str(config.get("merge_strategy", "inner"))
+
+    dropped_columns = {
+        "reference": non_numeric_columns(reference_df, timestamp_column),
+        "sensor": non_numeric_columns(sensor_df, timestamp_column),
+    }
 
     ref_resampled = resample_timeseries(reference_df, timestamp_column, rule, aggregation)
     sen_resampled = resample_timeseries(sensor_df, timestamp_column, rule, aggregation)
@@ -231,4 +277,5 @@ def align_and_merge_datasets(
         "alignment_percentage": alignment_percentage,
         "reference_rows_after_resample": reference_records,
         "sensor_rows_after_resample": sensor_records,
+        "dropped_non_numeric_columns": dropped_columns,
     }

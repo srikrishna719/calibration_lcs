@@ -20,6 +20,18 @@ except ImportError:  # pragma: no cover
     variance_inflation_factor = None
 
 
+# Column names produced by ``compute_coefficient_table``. Anything that renders
+# or reformats that table must use these exact names — the casing has silently
+# broken PDF and UI formatting before.
+COEFFICIENT_TABLE_COLUMNS = [
+    "Variable",
+    "Coefficient",
+    "Std Error",
+    "t-statistic",
+    "p-value",
+]
+
+
 def compute_vif(X: pd.DataFrame) -> pd.DataFrame:
     """Compute variance inflation factor for each numeric predictor."""
     if sm is None or variance_inflation_factor is None:
@@ -140,7 +152,7 @@ def compute_coefficient_table(
                 "t-statistic": round(float(tvalues.loc[name]), 6),
                 "p-value": round(float(pvalues.loc[name]), 6),
             })
-        return pd.DataFrame(rows)
+        return pd.DataFrame(rows, columns=COEFFICIENT_TABLE_COLUMNS)
 
     if hasattr(ols_result, "coef_"):
         names = [str(name) for name in (feature_names or [])]

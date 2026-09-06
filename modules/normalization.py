@@ -43,6 +43,26 @@ def _canonical_method(method: Optional[str]) -> str:
     raise ValueError(f"Unsupported normalization method '{method}'. Choose from: {supported}")
 
 
+def build_scaler(method: Optional[str]) -> object | None:
+    """Return an unfitted scaler for ``method``, or ``None`` for no scaling.
+
+    The scaler emits pandas output so feature names survive the transform. That
+    matters when it is composed into a modelling pipeline: downstream
+    estimators (notably the statsmodels OLS wrapper) rely on column names.
+
+    Use this when scaling belongs inside a model pipeline, so the scaler is fit
+    on training folds only and travels with the exported model. Use
+    :func:`normalize_dataset` for standalone/preview scaling of a whole frame.
+    """
+    method_name = _canonical_method(method)
+    if method_name == "none":
+        return None
+
+    scaler = SCALER_MAP[method_name]()
+    scaler.set_output(transform="pandas")
+    return scaler
+
+
 def _valid_numeric_columns(df: pd.DataFrame, columns: Iterable[str]) -> list[str]:
     """Return requested columns that exist and are numeric."""
     numeric_cols = set(df.select_dtypes(include=[np.number]).columns.tolist())
@@ -57,6 +77,12 @@ def normalize_dataset(
     return_scaler: bool = False,
 ) -> pd.DataFrame | tuple[pd.DataFrame, object | None]:
     """Normalize selected numeric columns with a supported sklearn scaler.
+
+    This fits on the whole frame, so it is for standalone transforms and UI
+    previews only. Do **not** use it to scale a modelling dataset before
+    training: that leaks test-fold statistics into the fit and leaves the
+    scaler behind, so the exported model cannot be applied to raw data. Compose
+    :func:`build_scaler` into the model pipeline instead.
 
     By default this returns only the normalized dataframe. Set
     ``return_scaler=True`` when a caller also needs the fitted scaler object.

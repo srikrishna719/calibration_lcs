@@ -58,7 +58,11 @@ def build_sample_demo_state(
 
     numeric_cols = [column for column in merged.select_dtypes(include="number").columns if column != ts_col]
     target_col = _reference_target_name(config, numeric_cols)
-    predictors = [column for column in numeric_cols if column != target_col]
+    # Match the app's default: reference-instrument columns are not predictors,
+    # because a deployed sensor cannot supply them.
+    reference_prefix = str(config.get("data", {}).get("reference_prefix", "reference"))
+    candidates = [column for column in numeric_cols if column != target_col]
+    predictors = [c for c in candidates if not str(c).startswith(f"{reference_prefix}_")] or candidates
     if not predictors:
         raise ValueError("Demo workflow could not find sensor predictor columns.")
 
@@ -69,25 +73,30 @@ def build_sample_demo_state(
         timestamp_column=ts_col,
         target_column=target_col,
         config=feature_config,
+        sensor_prefix=str(config.get("data", {}).get("sensor_prefix", "sensor")),
     )
 
     norm_method = str(config.get("normalization", {}).get("method", "none")).strip().lower()
-    norm_cols = [column for column in featured.columns if column not in [ts_col, target_col]]
-    if norm_method == "none":
-        normalized_base = featured.copy()
-        normalization_summary = get_normalization_summary(featured, featured, norm_cols)
-    else:
-        before = featured.copy()
-        normalized_base = normalize_dataset(featured.copy(), norm_cols, norm_method)
-        normalization_summary = get_normalization_summary(before, normalized_base, norm_cols)
 
-    normalized = append_time_features(
-        dataframe=normalized_base,
+    # Training gets the unscaled frame; the scaler is composed into each model
+    # so it is fit per fold and exported with it. ``normalized`` is display only.
+    # Time features join the matrix first, because the model scales them too.
+    modelling_dataset = append_time_features(
+        dataframe=featured.copy(),
         timestamp_column=ts_col,
         config=feature_config,
     )
-    added_time_columns = [column for column in normalized.columns if column not in normalized_base.columns]
-    modeling_outputs = train_on_prepared_dataset(normalized, target_col, config)
+    added_time_columns = [column for column in modelling_dataset.columns if column not in featured.columns]
+
+    norm_cols = [column for column in modelling_dataset.columns if column not in [ts_col, target_col]]
+    if norm_method == "none":
+        normalized = modelling_dataset.copy()
+    else:
+        normalized = normalize_dataset(modelling_dataset.copy(), norm_cols, norm_method)
+    normalization_summary = get_normalization_summary(modelling_dataset, normalized, norm_cols)
+    modeling_outputs = train_on_prepared_dataset(
+        modelling_dataset, target_col, config, normalization_method=norm_method
+    )
 
     return {
         "config": config,
@@ -102,6 +111,7 @@ def build_sample_demo_state(
         "feature_engineering_outputs": {"featured_dataset": featured},
         "featured_preview": featured,
         "normalization_outputs": {
+            "modelling_dataset": modelling_dataset,
             "normalized_dataset": normalized,
             "method": norm_method,
             "summary": normalization_summary,

@@ -13,6 +13,57 @@ import pandas as pd
 
 
 # ---------------------------------------------------------------------------
+# Time features that do not repeat
+# ---------------------------------------------------------------------------
+
+# Seconds and days since an epoch only ever increase, so a model can use them to
+# memorise *when* rather than learn the sensor-reference relationship, and has
+# nothing to go on beyond the training window.
+ALWAYS_MONOTONIC_TIME_FEATURES = ("unix_timestamp", "calendar_date")
+
+# Day-of-year repeats, but only if the data covers more than one year. Over a
+# three-month campaign it rises monotonically and behaves like the two above.
+SEASONAL_TIME_FEATURES = ("julian_date", "season")
+
+_ONE_YEAR_DAYS = 365.0
+
+
+def monotonic_time_features(
+    columns: Iterable[str],
+    span_days: Optional[float] = None,
+) -> List[str]:
+    """Time features that never repeat within the data, so cannot generalise forward.
+
+    A model fitted on these extrapolates a trend past the training window: on a
+    three-month co-location, adding ``unix_timestamp`` took a random forest from
+    0.271 to 0.218 R2 when applied to the following weeks, and took ridge below
+    zero. Shuffled K-Fold hides this entirely, because it interleaves past and
+    future, so the same feature *raised* the reported K-Fold score.
+
+    Parameters
+    ----------
+    columns:
+        Column names present in the modelling frame.
+    span_days:
+        Time covered by the data. Day-of-year and season are only flagged when
+        the span is under a year; over multiple years they are genuinely cyclic.
+    """
+    present = set(str(column) for column in columns)
+    flagged = [name for name in ALWAYS_MONOTONIC_TIME_FEATURES if name in present]
+    if span_days is None or span_days < _ONE_YEAR_DAYS:
+        flagged.extend(name for name in SEASONAL_TIME_FEATURES if name in present)
+    return flagged
+
+
+def dataset_span_days(timestamps: pd.Series) -> Optional[float]:
+    """Days between the first and last timestamp, or None when undeterminable."""
+    parsed = pd.to_datetime(timestamps, errors="coerce").dropna()
+    if parsed.empty:
+        return None
+    return float((parsed.max() - parsed.min()).total_seconds() / 86400.0)
+
+
+# ---------------------------------------------------------------------------
 # Column selection
 # ---------------------------------------------------------------------------
 
@@ -20,17 +71,28 @@ def select_feature_columns(
     dataframe: pd.DataFrame,
     target_column: str,
     config: Dict[str, object],
+    sensor_prefix: str = "sensor",
 ) -> List[str]:
-    """Select numeric feature columns, including optional meteorological variables."""
+    """Select numeric feature columns, including optional meteorological variables.
+
+    When ``optional_columns`` is set it narrows the pool to those columns plus
+    the sensor channels. ``sensor_prefix`` must match ``data.sensor_prefix``;
+    this used to be the hardcoded substring ``"sensor_"``, so renaming the
+    prefix silently emptied the feature set.
+    """
     numeric_columns = dataframe.select_dtypes(include=[np.number]).columns.tolist()
     feature_columns = [col for col in numeric_columns if col != target_column]
 
     optional_columns = [str(col) for col in config.get("optional_columns", [])]
     if optional_columns:
-        feature_columns = [
+        prefix = f"{str(sensor_prefix).rstrip('_')}_"
+        narrowed = [
             col for col in feature_columns
-            if col in optional_columns or "sensor_" in col
+            if col in optional_columns or str(col).startswith(prefix)
         ]
+        # Narrowing to nothing means the prefix or the list does not match this
+        # dataset; using every feature beats engineering none of them.
+        feature_columns = narrowed or feature_columns
 
     return feature_columns
 
@@ -302,6 +364,7 @@ def engineer_sensor_features(
     timestamp_column: str,
     target_column: str,
     config: Dict[str, object],
+    sensor_prefix: str = "sensor",
 ) -> pd.DataFrame:
     """Apply sensor-derived features, excluding timestamp-derived features."""
     if not bool(config.get("enabled", True)):
@@ -311,6 +374,7 @@ def engineer_sensor_features(
         dataframe=dataframe,
         target_column=target_column,
         config=config,
+        sensor_prefix=sensor_prefix,
     )
 
     engineered = create_lag_features(

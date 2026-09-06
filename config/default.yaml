@@ -4,6 +4,15 @@ app:
 data:
   timestamp_column: timestamp
   target_column: pm25
+  # Rows sharing a timestamp mean the file holds more than one series (e.g. several
+  # co-located devices). error | first | last | mean | median. Keeping one arbitrary
+  # row per timestamp interleaves the devices, so that is not the default.
+  duplicate_timestamps: error
+  # Column identifying the device/site, and which one to keep. Leave null to be
+  # prompted, or set both to select a single series non-interactively.
+  device_column: null
+  reference_device: null
+  sensor_device: null
   timezone: UTC
   sensor_prefix: sensor
   reference_prefix: reference
@@ -12,6 +21,10 @@ preprocessing:
   missing_strategy: linear_interpolation_forward_fill
   outlier_method: iqr
   outlier_threshold: 1.5
+  # A row is dropped when ANY screened column calls it an outlier, so the loss
+  # compounds with column count even on clean data (~11% of rows across 16
+  # independent gaussian columns). Name columns here to screen only those.
+  outlier_columns: []
   reference:
     missing_strategy: linear_interpolation_forward_fill
     outlier_method: none
@@ -42,14 +55,16 @@ feature_engineering:
 normalization:
   method: none
 
-validation:
-  method: timeseriessplit
-
-modelling:
-  objective: null
-
 training:
   test_size: 0.2
+  # Reference-prefixed columns are readings from the instrument being calibrated
+  # against; a deployed sensor will not have them. Set true only for co-location
+  # analysis where using them is the point.
+  include_reference_predictors: false
+  # Columns that reconstruct the target algebraically (e.g. a
+  # sensor-minus-reference difference) are detected and dropped. Set true
+  # only if you know a flagged column is genuinely independent.
+  include_target_encoding_predictors: false
   cross_validation_folds: 5
   validation_method: timeseriessplit
   selected_models:
@@ -77,6 +92,3 @@ evaluation:
   sort_by: rmse
   ascending: true
 
-drift_analysis:
-  rolling_window: 6
-  drift_threshold: 1.5

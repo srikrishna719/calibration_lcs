@@ -9,8 +9,8 @@ from __future__ import annotations
 import json
 import io
 import sys
+import traceback
 from pathlib import Path
-from string import Template
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -46,6 +46,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from ui.model_guide import render_model_reference_guide
+from ui.theme import build_custom_css
 from ui.demo_workflow import (
     build_sample_demo_state,
     history_as_dataframe,
@@ -60,19 +62,20 @@ from ui.workflow import (
 )
 from models.predict import predict_with_model
 from models.model_registry import MODEL_GROUPS, MODEL_DISPLAY_NAMES
-from modules.drift_analysis import (
+from modules.download_helpers import render_chart_download, render_df_download
+from config.validation import load_config_text
+from evaluation.metrics import MAPE_MIN_DENOMINATOR
+from modules.data_loader import summarize_duplicate_timestamps
+from modules.feature_engineering import dataset_span_days, monotonic_time_features
+from modules.leakage import find_reference_encoding_columns, find_target_encoding_columns
+from modules.normalization import get_normalization_summary, normalize_dataset
+from modules.diagnostics import COEFFICIENT_TABLE_COLUMNS, compute_vif, shapiro_wilk_test
+from modules.plots import (
+    create_multi_model_metrics_bar,
     create_predicted_vs_actual_figure,
     create_qq_plot,
     create_residual_histogram,
     create_residual_vs_predicted_figure,
-    generate_post_analysis_outputs,
-)
-from modules.download_helpers import render_chart_download, render_df_download
-from modules.normalization import get_normalization_summary, normalize_dataset
-from modules.diagnostics import compute_vif, shapiro_wilk_test
-from modules.plots import (
-    create_bland_altman_plot,
-    create_multi_model_metrics_bar,
     create_multi_model_scatter,
     create_multi_model_timeseries,
     create_scatter_with_fit,
@@ -83,8 +86,6 @@ from pipeline.run_pipeline import (
     load_input_data,
     run_alignment_stage,
     run_eda_stage,
-    run_modeling_stage,
-    run_post_analysis_stage,
     run_preprocessing_stage,
     train_on_prepared_dataset,
 )
@@ -152,367 +153,6 @@ _INTERNAL_TO_DISPLAY = {
     "drop": "Drop Missing Rows",
 }
 
-# ---------------------------------------------------------------------------
-# Premium CSS — theme-parameterized (dark / light)
-# ---------------------------------------------------------------------------
-_PALETTES: Dict[str, Dict[str, str]] = {
-    "dark": {
-        "grad1": "#1e1b4b", "grad2": "#312e81", "grad3": "#4338ca",
-        "sidebar1": "#0f0a2e", "sidebar2": "#1e1b4b",
-        "header_text": "#e0e7ff", "subtext": "#a5b4fc",
-        "value_text": "#e0e7ff", "sidebar_label": "#c7d2fe",
-        "section_bg": "rgba(30, 27, 75, 0.4)",
-        "pill_bg": "rgba(99, 102, 241, 0.15)",
-        "page_bg": "#0f0a2e", "page_text": "#e0e7ff",
-        "step_dot_idle": "#1e1b4b",
-        "widget_bg": "#171433", "widget_border": "#4338ca",
-        "alert_border": "rgba(226, 232, 240, 0.15)",
-    },
-    "light": {
-        "grad1": "#e0e7ff", "grad2": "#c7d2fe", "grad3": "#818cf8",
-        "sidebar1": "#f8fafc", "sidebar2": "#eef2ff",
-        "header_text": "#1e1b4b", "subtext": "#4338ca",
-        "value_text": "#1e1b4b", "sidebar_label": "#312e81",
-        "section_bg": "rgba(99, 102, 241, 0.06)",
-        "pill_bg": "rgba(99, 102, 241, 0.10)",
-        "page_bg": "#f8fafc", "page_text": "#1e1b4b",
-        "step_dot_idle": "#c7d2fe",
-        "widget_bg": "#ffffff", "widget_border": "#c7d2fe",
-        "alert_border": "rgba(30, 27, 75, 0.10)",
-    },
-}
-
-_CUSTOM_CSS_TEMPLATE = Template("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-
-/* Global */
-html, body, [class*="st-"] {
-    font-family: 'Inter', sans-serif;
-}
-
-/* Page-wide chrome (keeps native Streamlit containers in sync with the toggle,
-   overriding Streamlit's own auto-detected OS/browser theme so the in-app
-   toggle is authoritative regardless of the visitor's environment) */
-[data-testid="stAppViewContainer"] {
-    background-color: $page_bg;
-    color: $page_text;
-}
-[data-testid="stHeader"] {
-    background-color: transparent;
-}
-[data-testid="stMarkdownContainer"] p,
-[data-testid="stMarkdownContainer"] li,
-[data-testid="stMarkdownContainer"] span,
-[data-testid="stMarkdownContainer"] strong,
-[data-testid="stMarkdownContainer"] h1,
-[data-testid="stMarkdownContainer"] h2,
-[data-testid="stMarkdownContainer"] h3,
-[data-testid="stMarkdownContainer"] h4,
-[data-testid="stMarkdownContainer"] h5 {
-    color: $page_text;
-}
-label, [data-testid="stWidgetLabel"] p,
-[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p,
-[data-testid="stMetricValue"], [data-testid="stMetricLabel"],
-[data-testid="stCheckbox"] label p, [data-testid="stRadio"] label p {
-    color: $page_text !important;
-}
-[data-testid="stExpander"] {
-    background-color: $section_bg;
-    border-radius: 10px;
-}
-[data-testid="stExpander"] summary p {
-    color: $page_text !important;
-}
-
-/* Native input/control chrome — Streamlit bakes these to its own detected
-   OS/browser theme, not this app's custom CSS, so they need explicit
-   overrides to actually follow the Dark/Light toggle. */
-[data-testid="stBaseButton-secondary"],
-[data-testid="stBaseButton-primary"],
-[data-testid="stFileUploader"] button {
-    background-color: $widget_bg !important;
-    color: $page_text !important;
-    border: 1px solid $widget_border !important;
-}
-[data-testid="stFileUploaderDropzone"] {
-    background-color: $widget_bg !important;
-    border: 1px dashed $widget_border !important;
-}
-[data-testid="stFileUploaderDropzone"] * {
-    color: $page_text !important;
-}
-[data-testid="stTextInput"] input,
-[data-testid="stNumberInput"] input,
-[data-testid="stTextArea"] textarea,
-[data-testid="stSelectbox"] div[data-baseweb="select"] > div,
-[data-testid="stMultiSelect"] div[data-baseweb="select"] > div {
-    background-color: $widget_bg !important;
-    color: $page_text !important;
-    border-color: $widget_border !important;
-}
-[data-testid="stSelectbox"] div[data-baseweb="select"] span,
-[data-testid="stMultiSelect"] div[data-baseweb="select"] span {
-    color: $page_text !important;
-}
-[data-testid="stTabs"] button p {
-    color: $subtext !important;
-}
-[data-testid="stTabs"] button[aria-selected="true"] p {
-    color: $page_text !important;
-}
-[data-testid="stDataFrame"] {
-    background-color: $widget_bg;
-    border: 1px solid $widget_border;
-}
-[data-testid="stAlert"] {
-    border: 1px solid $alert_border;
-}
-
-/* Tooltips and dropdown menus (BaseWeb) are rendered in a portal appended
-   near <body>, outside the themed app container, so they need their own
-   explicit overrides — they don't inherit anything from the rules above. */
-[data-baseweb="tooltip"] {
-    background-color: transparent !important;
-    color: $page_text !important;
-}
-[data-baseweb="tooltip"] > div {
-    background-color: $widget_bg !important;
-    border: 1px solid $widget_border !important;
-}
-[data-baseweb="tooltip"] * {
-    color: $page_text !important;
-}
-[data-baseweb="popover"] {
-    background-color: $widget_bg !important;
-    border: 1px solid $widget_border !important;
-    color: $page_text !important;
-}
-[data-baseweb="popover"] * {
-    color: $page_text !important;
-}
-[data-baseweb="menu"] li:hover,
-[data-baseweb="popover"] li[aria-selected="true"] {
-    background-color: $section_bg !important;
-}
-
-/* Main header */
-.main-header {
-    background: linear-gradient(135deg, $grad1 0%, $grad2 50%, $grad3 100%);
-    padding: 1.5rem 2rem;
-    border-radius: 12px;
-    margin-bottom: 1.5rem;
-    box-shadow: 0 8px 32px rgba(67, 56, 202, 0.3);
-}
-.main-header h1 {
-    color: $header_text;
-    font-size: 1.8rem;
-    font-weight: 700;
-    margin: 0;
-    letter-spacing: -0.02em;
-}
-.main-header p {
-    color: $subtext;
-    font-size: 0.9rem;
-    margin: 0.3rem 0 0 0;
-}
-
-/* Step progress */
-.step-progress {
-    display: flex;
-    gap: 4px;
-    margin-bottom: 1.2rem;
-}
-.step-dot {
-    flex: 1;
-    height: 4px;
-    border-radius: 2px;
-    background: $step_dot_idle;
-    transition: background 0.3s ease;
-}
-.step-dot.active {
-    background: linear-gradient(90deg, #6366f1, #8b5cf6);
-    box-shadow: 0 0 8px rgba(99, 102, 241, 0.5);
-}
-.step-dot.done {
-    background: #10b981;
-}
-
-/* Metric cards */
-.metric-card {
-    background: linear-gradient(135deg, $grad1, $grad2);
-    border: 1px solid $grad3;
-    border-radius: 10px;
-    padding: 1rem 1.2rem;
-    text-align: center;
-    transition: transform 0.2s ease, box-shadow 0.2s ease;
-}
-.metric-card:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 8px 24px rgba(99, 102, 241, 0.25);
-}
-.metric-card .label {
-    color: $subtext;
-    font-size: 0.75rem;
-    font-weight: 500;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-}
-.metric-card .value {
-    color: $value_text;
-    font-size: 1.4rem;
-    font-weight: 700;
-    margin-top: 0.25rem;
-}
-.metric-card .value.good { color: #34d399; }
-.metric-card .value.warn { color: #fbbf24; }
-.metric-card .value.bad  { color: #f87171; }
-
-/* Section card */
-.section-card {
-    background: $section_bg;
-    border: 1px solid rgba(99, 102, 241, 0.2);
-    border-radius: 10px;
-    padding: 1.2rem;
-    margin-bottom: 1rem;
-}
-
-/* Sidebar refinements */
-section[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, $sidebar1 0%, $sidebar2 100%);
-}
-section[data-testid="stSidebar"] .stRadio label {
-    font-size: 0.92rem;
-    font-weight: 500;
-    padding: 0.4rem 0;
-}
-
-/* Buttons */
-.stButton button {
-    border-radius: 8px;
-    font-weight: 600;
-    letter-spacing: 0.02em;
-    transition: all 0.2s ease;
-}
-.stButton button:hover {
-    transform: translateY(-1px);
-    box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
-}
-
-/* Dataframes */
-.stDataFrame {
-    border-radius: 8px;
-    overflow: hidden;
-}
-
-/* Info cards */
-.info-pill {
-    display: inline-block;
-    background: $pill_bg;
-    color: $subtext;
-    padding: 0.3rem 0.8rem;
-    border-radius: 20px;
-    font-size: 0.8rem;
-    font-weight: 500;
-    margin-right: 0.5rem;
-    margin-bottom: 0.3rem;
-}
-
-/* ============================================================
-   Fix: Streamlit 1.56 expander icon fallback text overlap
-   Root cause: 'keyboard_arrow_right'/'keyboard_arrow_down' text
-   renders as literal characters when Material Icons font fails.
-   Structure: details > summary > span > span > span (icon text)
-   ============================================================ */
-
-/* The icon span — completely suppress fallback text, show only the glyph */
-[data-testid="stExpander"] details summary span span span {
-    font-family: 'Material Icons', 'Material Icons Outlined', serif;
-    font-size: 0 !important;  /* hide raw text fallback */
-    display: inline-block;
-    width: 0;
-    height: 0;
-    overflow: hidden;
-    flex-shrink: 0;
-}
-/* Use parent span to show a clean arrow via CSS */
-[data-testid="stExpander"] details summary > span > span:first-child::before {
-    content: '▶';
-    font-size: 0.7rem;
-    color: $subtext;
-    display: inline-block;
-    transition: transform 0.2s ease;
-    margin-right: 2px;
-}
-[data-testid="stExpander"] details[open] summary > span > span:first-child::before {
-    content: '▼';
-}
-
-/* The summary row itself: flex layout to prevent overflow bleeding */
-[data-testid="stExpander"] details summary > span {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    width: 100%;
-    overflow: hidden;
-}
-
-/* Title text container: let it fill remaining space with ellipsis */
-[data-testid="stExpander"] details summary > span > div {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    flex: 1;
-    min-width: 0;
-}
-
-/* Sidebar label visibility */
-section[data-testid="stSidebar"] .stRadio > label {
-    color: $sidebar_label !important;
-    font-size: 0.85rem;
-    font-weight: 600;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-    margin-bottom: 0.5rem;
-}
-
-/* File uploader button — suppress Material Icons fallback text ('upload' literal) */
-/* Structure: button > span > span > span (icon text) + div > p (label text) */
-[data-testid="stFileUploader"] button span span span {
-    font-size: 0 !important;
-    width: 0;
-    height: 0;
-    overflow: hidden;
-    display: inline-block;
-}
-/* Show a clean upload arrow via the parent span instead */
-[data-testid="stFileUploader"] button > span > span:first-child::before {
-    content: '⬆';
-    font-size: 0.85rem;
-    margin-right: 4px;
-    display: inline-block;
-}
-/* Prevent button label text from being clipped */
-[data-testid="stFileUploader"] button {
-    overflow: visible;
-    white-space: nowrap;
-}
-
-/* Compact download buttons */
-.stDownloadButton button {
-    padding: 0.3rem 0.8rem;
-    font-size: 0.82rem;
-    min-height: 2rem;
-}
-</style>
-""")
-
-
-def _build_custom_css(theme: str) -> str:
-    """Render the premium CSS block for the given theme ('dark' or 'light')."""
-    tokens = _PALETTES.get(theme, _PALETTES["light"])
-    return _CUSTOM_CSS_TEMPLATE.safe_substitute(tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -521,7 +161,7 @@ def _build_custom_css(theme: str) -> str:
 
 def inject_css():
     theme = st.session_state.get("theme", "light")
-    st.markdown(_build_custom_css(theme), unsafe_allow_html=True)
+    st.markdown(build_custom_css(theme), unsafe_allow_html=True)
 
 
 def render_header():
@@ -606,13 +246,13 @@ def _best_row_style(row: pd.Series) -> list:
 def _format_coefficient_table(coef_table) -> pd.DataFrame:
     """Format a coefficient table with proper decimal places."""
     if coef_table is None or (isinstance(coef_table, pd.DataFrame) and coef_table.empty):
-        return pd.DataFrame(columns=["Variable", "Coefficient", "Std Error", "t-Statistic", "P-value"])
+        return pd.DataFrame(columns=COEFFICIENT_TABLE_COLUMNS)
     df = coef_table.copy()
-    for col in ["Coefficient", "Std Error", "t-Statistic"]:
+    for col in ["Coefficient", "Std Error", "t-statistic"]:
         if col in df.columns:
             df[col] = df[col].round(2)
-    if "P-value" in df.columns:
-        df["P-value"] = df["P-value"].apply(lambda x: f"{x:.4f}" if isinstance(x, float) else x)
+    if "p-value" in df.columns:
+        df["p-value"] = df["p-value"].apply(lambda x: f"{x:.4f}" if isinstance(x, float) else x)
     return df
 
 
@@ -654,6 +294,81 @@ def _prediction_scope_caption(scope: str) -> str:
     return "Showing full fitted predictions from the final model refit on all available modelling rows."
 
 
+def _render_time_feature_validation_warning(
+    model_df: pd.DataFrame,
+    timestamp_column: str,
+    validation_method: str,
+) -> None:
+    """Warn when a never-repeating time feature is scored by shuffled K-Fold.
+
+    That pairing is the one that misleads: the feature cannot generalise past
+    the training window, and shuffling interleaves past and future so the fold
+    scores go *up* rather than down. A user comparing models on K-Fold would
+    pick close to the worst one.
+    """
+    if timestamp_column not in model_df.columns:
+        return
+
+    span = dataset_span_days(model_df[timestamp_column])
+    flagged = monotonic_time_features(model_df.columns, span)
+    if not flagged:
+        return
+
+    names = ", ".join(f"`{name}`" for name in flagged)
+    span_note = f" over {span:.0f} days of data" if span else ""
+
+    if str(validation_method).strip().lower() == "kfold":
+        st.warning(
+            f"**{names} cannot generalise beyond the training period{span_note}, and K-Fold "
+            "will not show it.** Shuffled folds interleave past and future, so the reported "
+            "score goes up while the model gets worse on later data. Use TimeSeriesSplit or "
+            "Holdout to see the real effect, or turn this off on the Feature Engineering step."
+        )
+    else:
+        st.info(
+            f"{names}: values that never repeat{span_note}, so they suit reconstructing this "
+            "study period rather than a model applied to new data. The chronological validation "
+            "you have selected will reflect that; K-Fold would hide it."
+        )
+
+
+def _render_outlier_breakdown(label: str, summary) -> None:
+    """Explain a surprising outlier count by showing each column's contribution.
+
+    A row is dropped when any screened column objects, so with several columns
+    the total is much larger than any single one -- on independent columns the
+    survival rates multiply. Without the breakdown that total looks like a data
+    quality problem rather than an artefact of screening breadth.
+    """
+    by_column = getattr(summary, "outlier_rows_by_column", None) or {}
+    removed = getattr(summary, "rows_removed_as_outliers", 0)
+    if not by_column or not removed:
+        return
+
+    screened = getattr(summary, "outlier_columns", []) or []
+    largest = max(by_column.values())
+    share = removed / summary.original_rows if summary.original_rows else 0.0
+
+    with st.expander(
+        f"Outlier removal breakdown — {label} ({removed} rows, {share:.0%})",
+        expanded=share >= 0.10,
+    ):
+        if len(screened) > 1 and removed > largest:
+            st.caption(
+                f"{len(screened)} columns are screened and a row is dropped if any one of "
+                f"them flags it. The worst single column accounts for {largest} rows, but "
+                f"the union removes {removed}. Narrow the screen with "
+                "`preprocessing.outlier_columns` if that is more than you intended."
+            )
+        st.dataframe(
+            pd.DataFrame(
+                {"column": list(by_column), "rows it would remove alone": list(by_column.values())}
+            ),
+            width='stretch',
+            hide_index=True,
+        )
+
+
 def _normalization_summary_tables(summary: pd.DataFrame):
     """Split normalization summary into before/after display tables."""
     before_cols = [c for c in summary.columns if c.startswith("before_") or c == "column"]
@@ -678,6 +393,21 @@ def _parse_positive_int_list(text: str) -> list:
 
 def is_advanced_mode() -> bool:
     return st.session_state.get("app_mode", "Basic") == "Advanced"
+
+
+def report_error(exc: Exception) -> None:
+    """Show a failure, with the traceback available in Advanced mode.
+
+    Every step used to render only str(exc). That is fine for the errors this
+    app raises deliberately, but for anything unexpected it reduced the whole
+    diagnosis to a single word -- a bare KeyError showed as just the key name.
+    """
+    st.error(f"❌ {exc}")
+    if is_advanced_mode():
+        with st.expander("Technical details", expanded=False):
+            st.code("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+    else:
+        st.caption("Switch to Advanced mode in the sidebar to see the full traceback.")
 
 
 def _uploaded_csv_columns(uploaded_file) -> list[str]:
@@ -743,12 +473,8 @@ def cached_load_sample():
 
 @st.cache_data(show_spinner=False)
 def cached_config_from_text(text: str, suffix: str):
-    if suffix in {".yaml", ".yml"}:
-        import yaml
-        return yaml.safe_load(text)
-    if suffix == ".json":
-        return json.loads(text)
-    raise ValueError("Config must be YAML or JSON.")
+    """Parse and validate an uploaded config, with any unknown-section warnings."""
+    return load_config_text(text, suffix)
 
 
 @st.cache_data(show_spinner=False)
@@ -772,16 +498,48 @@ def cached_eda(merged_df, cfg_text, raw_df=None):
 
 
 @st.cache_data(show_spinner=False)
-def cached_modeling(merged_df, cfg_text, feature_subset_json="null"):
-    subset = json.loads(feature_subset_json)
-    return run_modeling_stage(merged_df, json.loads(cfg_text), feature_subset=subset)
+def cached_duplicate_summary(frame, timestamp_column):
+    return summarize_duplicate_timestamps(frame, timestamp_column)
 
 
 @st.cache_data(show_spinner=False)
-def cached_train_prepared(prepared_df, target_column, cfg_text, feature_subset_json="null"):
+def cached_leakage_scan(merged_df, target_column, reference_prefix="reference"):
+    """Pairwise leakage scan; cached because it is quadratic in columns.
+
+    Covers both columns that reconstruct the target and columns that hide a
+    reference reading (a sensor-minus-reference difference for some other
+    variable), which a deployed sensor could not supply.
+    """
+    numeric = [c for c in merged_df.select_dtypes(include="number").columns if c != target_column]
+    report = find_target_encoding_columns(merged_df, target_column, numeric)
+
+    reference_columns = [
+        c for c in merged_df.select_dtypes(include="number").columns
+        if str(c).startswith(f"{reference_prefix}_") and c != target_column
+    ]
+    remaining = [c for c in numeric if c not in report.excluded]
+    if reference_columns and remaining:
+        extra = find_reference_encoding_columns(merged_df, reference_columns, remaining)
+        for name in extra.excluded:
+            if name.startswith(f"{reference_prefix}_") or name in report.reasons:
+                continue
+            report.excluded.append(name)
+            report.reasons[name] = extra.reasons[name]
+        report.exact_pairs.extend(extra.exact_pairs)
+    return report
+
+
+@st.cache_data(show_spinner=False)
+def cached_train_prepared(
+    prepared_df, target_column, cfg_text, feature_subset_json="null", normalization_method="none"
+):
     subset = json.loads(feature_subset_json)
     return train_on_prepared_dataset(
-        prepared_df, target_column, json.loads(cfg_text), feature_subset=subset
+        prepared_df,
+        target_column,
+        json.loads(cfg_text),
+        feature_subset=subset,
+        normalization_method=normalization_method,
     )
 
 
@@ -810,7 +568,6 @@ def init_state():
         "feature_engineering_outputs": None,
         "normalization_outputs": None,
         "diagnostics_outputs": None,
-        "post_analysis_outputs": None,
         "residual_analysis_outputs": None,
         "export_bundle": None,
         "run_history": [],
@@ -837,24 +594,24 @@ _DOWNSTREAM_FROM_UPLOAD = (
     "preprocessing_outputs", "alignment_outputs", "eda_outputs",
     "selected_target", "selected_predictors", "selected_model_name",
     "variable_selection_outputs", "feature_engineering_outputs", "normalization_outputs",
-    "modeling_outputs", "diagnostics_outputs", "post_analysis_outputs",
+    "modeling_outputs", "diagnostics_outputs",
     "residual_analysis_outputs", "export_bundle", "featured_preview", "selected_features",
 )
 _DOWNSTREAM_FROM_PREPROCESSING = (
     "alignment_outputs", "eda_outputs", "selected_target", "selected_predictors",
     "selected_model_name", "variable_selection_outputs", "feature_engineering_outputs",
     "normalization_outputs", "modeling_outputs", "diagnostics_outputs",
-    "post_analysis_outputs", "residual_analysis_outputs", "export_bundle",
+    "residual_analysis_outputs", "export_bundle",
     "featured_preview", "selected_features",
 )
 _DOWNSTREAM_FROM_ALIGNMENT = (
     "eda_outputs", "selected_target", "selected_predictors", "selected_model_name",
     "variable_selection_outputs", "feature_engineering_outputs", "normalization_outputs",
-    "modeling_outputs", "diagnostics_outputs", "post_analysis_outputs",
+    "modeling_outputs", "diagnostics_outputs",
     "residual_analysis_outputs", "export_bundle", "featured_preview", "selected_features",
 )
 _DOWNSTREAM_FROM_MODELING = (
-    "diagnostics_outputs", "post_analysis_outputs", "residual_analysis_outputs", "export_bundle"
+    "diagnostics_outputs", "residual_analysis_outputs", "export_bundle"
 )
 
 
@@ -961,11 +718,18 @@ def resolve_inputs(ref_file, sen_file, use_sample):
 
 
 def resolve_config(uploaded_file):
+    """Return a validated config, surfacing sections the pipeline will ignore."""
     if uploaded_file is None:
         return load_config(DEFAULT_CONFIG_PATH)
     suffix = Path(uploaded_file.name).suffix.lower()
     text = uploaded_file.getvalue().decode("utf-8")
-    return cached_config_from_text(text, suffix)
+    config, unknown = cached_config_from_text(text, suffix)
+    if unknown:
+        st.warning(
+            "These top-level sections are not read by the pipeline and will be "
+            "ignored — check for a typo: " + ", ".join(f"`{name}`" for name in unknown)
+        )
+    return config
 
 
 # ---------------------------------------------------------------------------
@@ -1038,7 +802,6 @@ def render_upload():
                     st.session_state[state_key] = state_value
                 _reset_downstream(
                     "diagnostics_outputs",
-                    "post_analysis_outputs",
                     "residual_analysis_outputs",
                     "export_bundle",
                 )
@@ -1046,7 +809,7 @@ def render_upload():
                 st.session_state.current_step = STEPS[8]
                 st.rerun()
             except Exception as e:
-                st.error(f"❌ {e}")
+                report_error(e)
 
     # Preview
     with st.expander("👀 Preview bundled sample datasets"):
@@ -1123,6 +886,104 @@ def render_upload():
         config["data"]["target_column"] = target_col
         config["data"]["timezone"] = tz
 
+    # ---- Repeated timestamps: several series in one file ----
+    # Resolved here rather than at load time, because keeping one arbitrary row
+    # per timestamp silently interleaves co-located devices.
+    try:
+        _ref_preview, _sen_preview, _ = resolve_inputs(ref_file, sen_file, use_sample)
+    except Exception:
+        _ref_preview = _sen_preview = None
+
+    if _ref_preview is not None and ts_col in _ref_preview.columns and ts_col in _sen_preview.columns:
+        ref_dupes = cached_duplicate_summary(_ref_preview, ts_col)
+        sen_dupes = cached_duplicate_summary(_sen_preview, ts_col)
+
+        if ref_dupes.duplicate_rows or sen_dupes.duplicate_rows:
+            with st.expander("⚠️ Repeated timestamps detected", expanded=True):
+                for label, summary in (("Reference", ref_dupes), ("LCS (Sensor)", sen_dupes)):
+                    if summary.duplicate_rows:
+                        st.warning(f"**{label}** — {summary.message()}")
+
+                shared = [
+                    c for c in ref_dupes.candidate_group_columns
+                    if c in sen_dupes.candidate_group_columns
+                ] or ref_dupes.candidate_group_columns or sen_dupes.candidate_group_columns
+
+                choices = {
+                    "Model one device (recommended)": "select",
+                    "Average the devices at each timestamp": "mean",
+                    "Median of the devices at each timestamp": "median",
+                    "Keep the first row per timestamp": "first",
+                }
+                if not shared:
+                    choices.pop("Model one device (recommended)")
+
+                choice_label = st.radio(
+                    "How should these be resolved?",
+                    list(choices.keys()),
+                    key="dup_strategy_choice",
+                    help=(
+                        "Each timestamp must identify one observation. Modelling a single "
+                        "device is the safest reading of co-location data; averaging builds "
+                        "a composite sensor; keeping the first row mixes devices together "
+                        "and is only right for genuine exact duplicates."
+                    ),
+                )
+                choice = choices[choice_label]
+
+                if choice == "select":
+                    device_column = st.selectbox(
+                        "Column identifying the device or site",
+                        shared,
+                        key="dup_group_column",
+                        help="Chosen because it makes timestamps unique.",
+                    )
+                    dc1, dc2 = st.columns(2)
+                    ref_options = sorted(_ref_preview[device_column].astype(str).unique()) \
+                        if device_column in _ref_preview.columns else []
+                    sen_options = sorted(_sen_preview[device_column].astype(str).unique()) \
+                        if device_column in _sen_preview.columns else []
+                    config["data"]["device_column"] = device_column
+                    config["data"]["duplicate_timestamps"] = "first"
+                    if ref_options:
+                        config["data"]["reference_device"] = dc1.selectbox(
+                            "Reference series", ref_options, key="dup_ref_device")
+                    if sen_options:
+                        config["data"]["sensor_device"] = dc2.selectbox(
+                            "Sensor series", sen_options, key="dup_sen_device")
+
+                    # Selecting a series only helps the dataset that carries the
+                    # column. Say plainly what happens to one that it cannot fix,
+                    # rather than letting the "first" fallback apply quietly.
+                    for label, frame, chosen in (
+                        ("Reference", _ref_preview, config["data"].get("reference_device")),
+                        ("LCS (Sensor)", _sen_preview, config["data"].get("sensor_device")),
+                    ):
+                        if device_column in frame.columns and chosen is not None:
+                            remaining = frame[frame[device_column].astype(str) == str(chosen)]
+                        else:
+                            remaining = frame
+                        if remaining[ts_col].duplicated().any():
+                            st.caption(
+                                f"⚠️ {label} still has repeated timestamps after this "
+                                f"selection ({int(remaining[ts_col].duplicated().sum())} rows). "
+                                "The first row of each will be kept — use an averaging option "
+                                "instead if those are separate series rather than exact repeats."
+                            )
+                else:
+                    config["data"]["duplicate_timestamps"] = choice
+                    config["data"]["device_column"] = None
+                    config["data"]["reference_device"] = None
+                    config["data"]["sensor_device"] = None
+        else:
+            config["data"]["duplicate_timestamps"] = "error"
+
+    duplicate_settings = {
+        key: config["data"].get(key)
+        for key in ("duplicate_timestamps", "device_column", "reference_device", "sensor_device")
+    }
+    st.session_state.config = config
+
     if st.button("🚀 Load & Validate Data", key="run_upload", width='stretch',
                  help="Loads, parses and validates both CSV files. Any format errors will be shown below."):
         try:
@@ -1131,6 +992,7 @@ def render_upload():
             config["data"]["timestamp_column"] = ts_col
             config["data"]["target_column"] = target_col
             config["data"]["timezone"] = tz
+            config["data"].update(duplicate_settings)
             cfg_text = _cfg_to_json(config)
             data_out = cached_load_input(ref_src, sen_src, cfg_text)
             st.session_state.config = config
@@ -1140,7 +1002,7 @@ def render_upload():
             _reset_downstream(*_DOWNSTREAM_FROM_UPLOAD)
             st.success(f"✅ Data loaded successfully from **{label}**")
         except Exception as e:
-            st.error(f"❌ {e}")
+            report_error(e)
 
     if st.session_state.data_outputs is not None:
         pills = (
@@ -1315,7 +1177,7 @@ def render_preprocessing():
                 _reset_downstream(*_DOWNSTREAM_FROM_PREPROCESSING)
                 st.success("✅ Preprocessing completed")
             except Exception as e:
-                st.error(f"❌ {e}")
+                report_error(e)
 
     out = st.session_state.preprocessing_outputs
     if out is not None:
@@ -1338,6 +1200,9 @@ def render_preprocessing():
                 + info_pill(f"Outliers removed: {sen_s.rows_removed_as_outliers}"),
                 unsafe_allow_html=True,
             )
+
+        _render_outlier_breakdown("Reference", ref_s)
+        _render_outlier_breakdown("LCS (Sensor)", sen_s)
 
         tab1, tab2 = st.tabs(["Reference (cleaned)", "Sensor (cleaned)"])
         with tab1:
@@ -1443,7 +1308,7 @@ def render_alignment():
                 _reset_downstream(*_DOWNSTREAM_FROM_ALIGNMENT)
                 st.success("✅ Alignment completed")
             except Exception as e:
-                st.error(f"❌ {e}")
+                report_error(e)
 
     out = st.session_state.alignment_outputs
     if out is not None:
@@ -1456,6 +1321,19 @@ def render_alignment():
             + info_pill(f"Lag column: {meta['lag_detection_column']}")
         )
         st.markdown(pills, unsafe_allow_html=True)
+
+        dropped = meta.get("dropped_non_numeric_columns", {}) or {}
+        dropped_notes = [
+            f"{label.capitalize()}: {', '.join(columns)}"
+            for label, columns in dropped.items()
+            if columns
+        ]
+        if dropped_notes:
+            st.caption(
+                "Non-numeric columns were excluded from resampling (they cannot be aggregated) — "
+                + " | ".join(dropped_notes)
+            )
+
         st.dataframe(out["merged_data"].head(20), width='stretch')
         render_df_download(out["merged_data"], key="merged_data_csv", filename="merged_aligned_data.csv")
 
@@ -1484,7 +1362,7 @@ def render_eda():
                 st.session_state.eda_outputs = outputs
                 st.success("✅ EDA generated")
             except Exception as e:
-                st.error(f"❌ {e}")
+                report_error(e)
 
     out = st.session_state.eda_outputs
     if out is not None:
@@ -1619,22 +1497,99 @@ def render_variable_selection():
         st.error("No numeric columns available for variable selection.")
         return
 
+    data_cfg = config["data"]
+    reference_prefix = str(data_cfg.get("reference_prefix", "reference"))
+    sensor_prefix = str(data_cfg.get("sensor_prefix", "sensor"))
+
     st.markdown("Select the **target** (reference) variable and **predictor** (sensor) variables.")
 
+    # Default to the configured reference target rather than whichever numeric
+    # column happens to sort first.
+    configured_target = f"{reference_prefix}_{data_cfg.get('target_column', '')}"
+    target_index = numeric_cols.index(configured_target) if configured_target in numeric_cols else 0
     target = st.selectbox(
         "Target variable (what you are calibrating against)",
         numeric_cols,
-        index=0,
+        index=target_index,
         key="var_sel_target",
         help="The reference measurement column that the model should predict.",
     )
 
     predictor_options = [c for c in numeric_cols if c != target]
-    default_predictors = [c for c in predictor_options if c in (st.session_state.selected_predictors or predictor_options)]
+
+    # Columns that reconstruct the target algebraically -- a sensor-minus-reference
+    # difference, a residual, a renamed copy of the target. A model using one scores
+    # near-perfectly and has learned nothing, and correlation does not reveal them,
+    # so this is a pairwise fit against the chosen target.
+    leakage = cached_leakage_scan(merged, target, reference_prefix)
+    leaking = [c for c in predictor_options if c in leakage.excluded]
+    if leaking:
+        st.error(
+            "**Excluded from predictors: these columns encode the target.**\n\n"
+            + "\n".join(
+                f"- `{name}` — {leakage.reasons[name]}" for name in leaking
+            )
+        )
+        allow_leaking = st.checkbox(
+            "Offer them anyway (I know these columns are independent)",
+            value=False,
+            key="var_sel_allow_leaking",
+            help=(
+                "Leave off unless the detection is wrong for your data. A model trained on "
+                "a column that carries the reference value will report near-perfect metrics "
+                "and cannot be applied to a sensor on its own."
+            ),
+        )
+        if not allow_leaking:
+            predictor_options = [c for c in predictor_options if c not in leaking]
+    elif leakage.skipped_reason:
+        st.caption(f"Target-encoding check skipped: {leakage.skipped_reason}")
+
+    reference_options = [c for c in predictor_options if c.startswith(f"{reference_prefix}_")]
+    sensor_options = [c for c in predictor_options if c.startswith(f"{sensor_prefix}_")]
+    other_options = [
+        c for c in predictor_options
+        if c not in reference_options and c not in sensor_options
+    ]
+    deployable = sensor_options + other_options
+
+    # Reference-station columns are measured by the instrument being calibrated
+    # against. A deployed low-cost sensor will not have them, so a model that
+    # depends on them cannot actually be used -- they are opt-in, not default.
+    include_reference = False
+    if reference_options and deployable:
+        include_reference = st.checkbox(
+            f"Also offer `{reference_prefix}_*` columns as predictors",
+            value=bool(set(st.session_state.selected_predictors or []) & set(reference_options)),
+            key="var_sel_include_reference",
+            help=(
+                "Off by default. These columns come from the reference instrument, not the "
+                "sensor being calibrated, so a model trained on them cannot be applied at "
+                "deployment where only sensor readings exist. Enable only for a co-location "
+                "analysis where that is what you intend to study."
+            ),
+        )
+    elif reference_options and not deployable:
+        # Nothing matches the sensor prefix, so offering only sensor columns
+        # would leave the user with nothing to select.
+        include_reference = True
+        st.caption(
+            f"No columns match the `{sensor_prefix}_` prefix, so all numeric columns are "
+            "offered. Check the sensor/reference prefixes in the Upload step if that is "
+            "unexpected."
+        )
+
+    available = deployable + (reference_options if include_reference else [])
+    if not available:
+        available = predictor_options
+
+    previous = [c for c in (st.session_state.selected_predictors or []) if c in available]
+    default_predictors = previous or [c for c in available if c in deployable] or available
+
     predictors = st.multiselect(
         "Predictor variables (sensor features)",
-        predictor_options,
-        default=default_predictors or predictor_options,
+        available,
+        default=default_predictors,
         key="var_sel_predictors",
         help="The sensor columns used as inputs to the calibration model.",
     )
@@ -1642,6 +1597,15 @@ def render_variable_selection():
     if not predictors:
         st.warning("Select at least one predictor variable.")
         return
+
+    chosen_reference = [c for c in predictors if c in reference_options]
+    if chosen_reference:
+        st.warning(
+            "Using reference-instrument columns as predictors: "
+            f"**{', '.join(chosen_reference)}**. The resulting model needs those readings to "
+            "make a prediction, so it cannot be applied to a sensor deployed on its own. "
+            "Metrics will look better than a deployable calibration would achieve."
+        )
 
     modelling_df = merged[[ts_col, target] + predictors].copy()
     st.session_state.selected_target = target
@@ -1745,7 +1709,13 @@ def render_feature_engineering():
 
     if advanced_mode:
         with st.expander("Advanced time features", expanded=False):
-            st.caption("Time features are appended after normalization so timestamp-derived columns are not scaled first.")
+            st.caption(
+                "Time features join the modelling matrix as ordinary numeric predictors and are "
+                "scaled with everything else by the model's own scaler. Absolute-time columns "
+                "(Unix timestamp, calendar date) let a model fit a trend over the deployment "
+                "period, which will not carry over to new data — prefer the cyclical encodings "
+                "unless you specifically want that trend."
+            )
             existing_tf = fe_config.get("time_feature_flags", {})
             add_time = st.checkbox(
                 "Enable time features",
@@ -1758,12 +1728,22 @@ def render_feature_engineering():
                 st.caption("Basic features (hour 0-23, day-of-week 0-6, day-of-month 1-31) always included. Enable extras:")
                 tc1, tc2, tc3 = st.columns(3)
                 tf = {"hour_of_day": True, "day_of_week": True, "day_of_month": True}
+                _forward_note = (
+                    " Only increases over a single deployment, so a model uses it to fit a "
+                    "trend it cannot continue past the training window. Measured on a "
+                    "three-month co-location, adding this took a random forest from 0.271 to "
+                    "0.218 R2 applied forward, and ridge below zero, while *raising* its "
+                    "K-Fold score. Useful for reconstructing the study period itself; not for "
+                    "a model you will apply to new data."
+                )
                 tf["unix_timestamp"] = tc1.checkbox("Unix timestamp", value=existing_tf.get("unix_timestamp", False), key="fe_tf_unix",
-                    help="Seconds since 1970-01-01. Useful as a linear time trend proxy for tree models.")
+                    help="Seconds since 1970-01-01." + _forward_note)
                 tf["julian_date"] = tc1.checkbox("Julian date (DOY)", value=existing_tf.get("julian_date", False), key="fe_tf_julian",
-                    help="Day-of-year (1-366). Captures seasonal variation without cyclical encoding.")
+                    help="Day-of-year (1-366). Genuinely seasonal once the data spans more than "
+                         "a year; within a shorter campaign it rises monotonically and behaves "
+                         "like a trend." + _forward_note)
                 tf["calendar_date"] = tc1.checkbox("Calendar date (int)", value=existing_tf.get("calendar_date", False), key="fe_tf_caldate",
-                    help="Integer days since 1970-01-01, day-resolution. Good for long-term trend.")
+                    help="Integer days since 1970-01-01, day-resolution." + _forward_note)
                 tf["cyclical_hour"] = tc2.checkbox("Cyclical hour sin/cos", value=existing_tf.get("cyclical_hour", False), key="fe_tf_cychour",
                     help="Encodes hour as sin/cos so hour 23 is treated as close to hour 0. Better than raw integer for linear models.")
                 tf["cyclical_dow"] = tc2.checkbox("Cyclical DOW sin/cos", value=existing_tf.get("cyclical_dow", False), key="fe_tf_cydow",
@@ -1787,12 +1767,13 @@ def render_feature_engineering():
                     timestamp_column=ts_col,
                     target_column=target_col,
                     config=fe_config,
+                    sensor_prefix=str(config["data"].get("sensor_prefix", "sensor")),
                 )
                 st.session_state.feature_engineering_outputs = {"featured_dataset": featured}
                 st.session_state.featured_preview = featured
                 st.success(f"\u2705 Sensor-derived features prepared: {len(featured.columns) - 2} features, {len(featured)} rows")
             except Exception as e:
-                st.error(f"\u274c {e}")
+                report_error(e)
 
     fe_out = st.session_state.feature_engineering_outputs
     if fe_out is not None:
@@ -1835,35 +1816,51 @@ def render_normalization():
     config.setdefault("normalization", {})["method"] = method
     st.session_state.config = config
 
+    if method != "none":
+        st.info(
+            "Scaling is applied **inside the model**, not to the dataset passed to training. "
+            "The scaler is re-fit on each training fold, so validation statistics never leak "
+            "into the fit behind the reported metrics, and it is stored inside the exported "
+            "model so the downloaded `model.pkl` can be applied to raw sensor readings. "
+            "The tables below preview what this scaling does to each column."
+        )
+
     if st.button("\U0001f680 Apply Normalization", key="apply_normalization", width='stretch'):
         with st.spinner("Normalizing..."):
             try:
-                norm_cols = [c for c in featured.columns if c not in [ts_col, target_col]]
-                if method == "none":
-                    normalized_base = featured.copy()
-                    summary = get_normalization_summary(featured, featured, norm_cols)
-                else:
-                    before = featured.copy()
-                    normalized_base = normalize_dataset(featured.copy(), norm_cols, method)
-                    summary = get_normalization_summary(before, normalized_base, norm_cols)
-
                 from modules.feature_engineering import append_time_features
-                normalized = append_time_features(
-                    dataframe=normalized_base,
+                time_cfg = config.get("feature_engineering", {})
+                # Build the complete modelling matrix first, time features
+                # included. They are ordinary numeric predictors, so the model's
+                # scaler standardises them alongside everything else -- the
+                # preview below has to cover them or it misreports what happens.
+                # The frame itself stays unscaled: train_models composes the
+                # scaler into each estimator, so it is fit per training fold and
+                # travels with the model that gets exported.
+                modelling_dataset = append_time_features(
+                    dataframe=featured.copy(),
                     timestamp_column=ts_col,
-                    config=config.get("feature_engineering", {}),
+                    config=time_cfg,
                 )
-                added_time_cols = [c for c in normalized.columns if c not in normalized_base.columns]
+                added_time_cols = [c for c in modelling_dataset.columns if c not in featured.columns]
+
+                norm_cols = [c for c in modelling_dataset.columns if c not in [ts_col, target_col]]
+                if method == "none":
+                    preview_dataset = modelling_dataset.copy()
+                else:
+                    preview_dataset = normalize_dataset(modelling_dataset.copy(), norm_cols, method)
+                summary = get_normalization_summary(modelling_dataset, preview_dataset, norm_cols)
 
                 st.session_state.normalization_outputs = {
-                    "normalized_dataset": normalized,
+                    "modelling_dataset": modelling_dataset,
+                    "normalized_dataset": preview_dataset,
                     "method": method,
                     "summary": summary,
                     "added_time_columns": added_time_cols,
                 }
                 st.success(f"\u2705 Normalization applied: {method_label}")
             except Exception as e:
-                st.error(f"\u274c {e}")
+                report_error(e)
 
     norm_out = st.session_state.normalization_outputs
     if norm_out is not None:
@@ -1886,8 +1883,16 @@ def render_normalization():
 
         added_time_cols = norm_out.get("added_time_columns", [])
         if added_time_cols:
-            st.caption(f"Time features added after normalization: {', '.join(added_time_cols)}")
+            st.caption(
+                "Time features in the modelling matrix, scaled with every other predictor: "
+                + ", ".join(added_time_cols)
+            )
         st.markdown("#### Normalized dataset preview")
+        if norm_out.get("method", "none") != "none":
+            st.caption(
+                "Preview only, for inspecting the scaling. Training receives the unscaled "
+                "frame and applies this scaler inside the model, fold by fold."
+            )
         st.dataframe(normalized.head(20), width='stretch')
         render_df_download(normalized, key="norm_dataset_csv", filename="normalized_dataset.csv")
 
@@ -1906,7 +1911,12 @@ def render_modelling():
         return
 
     config = st.session_state.config
-    model_df = st.session_state.normalization_outputs["normalized_dataset"]
+    norm_out = st.session_state.normalization_outputs
+    # Unscaled frame: the scaler is composed into each model by train_models.
+    model_df = norm_out.get("modelling_dataset")
+    if model_df is None:
+        model_df = norm_out["normalized_dataset"]
+    norm_method = str(norm_out.get("method", "none"))
     ts_col = config["data"]["timestamp_column"]
     target_col = st.session_state.selected_target
     if target_col is None or target_col not in model_df.columns:
@@ -1922,205 +1932,7 @@ def render_modelling():
         unsafe_allow_html=True,
     )
 
-    # ---- Model Reference Guide ----
-    with st.expander("📚 Model Reference Guide — How Each Model Works", expanded=False):
-        st.caption(
-            "Everything you need to know before training: how each model works, "
-            "the formula it uses, what inputs it needs, and every hyperparameter available. "
-            "Parameters marked ✅ are exposed in the UI below; ❌ use defaults or Auto-Tuning."
-        )
-        _mtabs = st.tabs([
-            "📐 Linear Regression",
-            "🔵 Ridge",
-            "🟡 Lasso",
-            "🌲 Random Forest",
-            "⚡ XGBoost",
-        ])
-
-        with _mtabs[0]:
-            st.markdown("#### Linear Regression (Ordinary Least Squares)")
-            st.markdown(
-                "The baseline model. Fits a straight-line relationship between your sensor features and "
-                "the reference PM value by **minimising the sum of squared errors**. "
-                "No regularisation — every feature gets a coefficient. Fast and fully interpretable."
-            )
-            st.markdown("**Formula:**")
-            st.latex(r"\hat{y} = \beta_0 + \beta_1 x_1 + \beta_2 x_2 + \cdots + \beta_n x_n")
-            st.markdown("**Objective (what it minimises):**")
-            st.latex(r"\min_{\boldsymbol{\beta}} \sum_{i=1}^{N}(y_i - \hat{y}_i)^2")
-            st.markdown("**What inputs does it need?**")
-            st.info(
-                "• **Numeric feature columns only** (sensor readings, lag features, rolling means, time features).\n"
-                "• Works best when the sensor–reference relationship is roughly **linear** "
-                "(e.g. raw PM channel vs reference PM).\n"
-                "• Sensitive to **correlated features** (multicollinearity) — if you add many lag/rolling columns, "
-                "use Ridge or Lasso instead.\n"
-                "• Feature scaling is NOT required, but helps compare coefficient magnitudes."
-            )
-            st.markdown("**All Hyperparameters:**")
-            st.markdown(
-                "| Parameter | Default | Exposed in UI | What it does |\n"
-                "|-----------|---------|---------------|--------------|\n"
-                "| `fit_intercept` | `True` | ❌ | Fit β₀ (intercept). Almost always True. |\n"
-                "| `positive` | `False` | ❌ | Force all coefficients ≥ 0. Rarely needed. |\n\n"
-                "> Linear Regression has **no regularisation parameters**. "
-                "If the model overfits or collinear features are a concern, switch to Ridge or Lasso."
-            )
-
-        with _mtabs[1]:
-            st.markdown("#### Ridge Regression (L2 Regularisation)")
-            st.markdown(
-                "Extends OLS with an **L2 penalty** on coefficient size. "
-                "All coefficients are **shrunk towards zero** (but never exactly zero). "
-                "Ideal when many correlated features are present — it distributes weight across them rather than "
-                "picking one arbitrarily."
-            )
-            st.markdown("**Formula:**")
-            st.latex(r"\hat{y} = \beta_0 + \sum_{j=1}^{n} \beta_j x_j")
-            st.markdown("**Objective:**")
-            st.latex(
-                r"\min_{\boldsymbol{\beta}} \left[ \sum_{i=1}^{N}(y_i - \hat{y}_i)^2 "
-                r"+ \alpha \sum_{j=1}^{n} \beta_j^2 \right]"
-            )
-            st.markdown("α controls the trade-off: **α → 0** = plain OLS · **α → ∞** = all coefficients → 0.")
-            st.markdown("**What inputs does it need?**")
-            st.info(
-                "• Any numeric feature columns.\n"
-                "• **Recommended** when you have lag/rolling features that are correlated with each other.\n"
-                "• Feature scaling helps (so the penalty is applied equally across all features).\n"
-                "• For PM calibration: good with humidity-corrected features (PM × RH terms)."
-            )
-            st.markdown("**All Hyperparameters:**")
-            st.markdown(
-                "| Parameter | Default | Exposed in UI | What it does |\n"
-                "|-----------|---------|---------------|--------------|\n"
-                "| `alpha` | `1.0` | ✅ | L2 penalty strength. Try: 0.01, 0.1, 1, 10, 100. |\n"
-                "| `fit_intercept` | `True` | ❌ | Whether to fit the intercept β₀. |\n"
-                "| `solver` | `'auto'` | ❌ | Algorithm: `'auto'`, `'svd'`, `'cholesky'`, `'lsqr'`. |\n"
-                "| `max_iter` | `None` | ❌ | Max iterations for iterative solvers. |\n"
-                "| `tol` | `1e-4` | ❌ | Convergence tolerance. |\n\n"
-                "> Auto-tuning searches: α ∈ {0.001, 0.01, 0.1, 0.5, 1, 5, 10, 50, 100}."
-            )
-
-        with _mtabs[2]:
-            st.markdown("#### Lasso Regression (L1 Regularisation)")
-            st.markdown(
-                "Like Ridge, but uses the **absolute value** of coefficients as the penalty. "
-                "The key difference: L1 can drive some coefficients to **exactly zero**, "
-                "automatically removing irrelevant features. "
-                "Acts as a built-in feature selector — useful when you suspect only a few inputs really matter."
-            )
-            st.markdown("**Formula:**")
-            st.latex(r"\hat{y} = \beta_0 + \sum_{j=1}^{n} \beta_j x_j")
-            st.markdown("**Objective:**")
-            st.latex(
-                r"\min_{\boldsymbol{\beta}} \left[ \sum_{i=1}^{N}(y_i - \hat{y}_i)^2 "
-                r"+ \alpha \sum_{j=1}^{n} |\beta_j| \right]"
-            )
-            st.markdown("Higher α → more zero coefficients → sparser model.")
-            st.markdown("**What inputs does it need?**")
-            st.info(
-                "• Any numeric feature columns.\n"
-                "• Very effective after polynomial expansion: Lasso will automatically discard the "
-                "polynomial terms that don't improve fit.\n"
-                "• Feature scaling is important so all features compete fairly for the L1 budget.\n"
-                "• For PM calibration: start with small α (0.001–0.01) and increase until only meaningful features remain."
-            )
-            st.markdown("**All Hyperparameters:**")
-            st.markdown(
-                "| Parameter | Default | Exposed in UI | What it does |\n"
-                "|-----------|---------|---------------|--------------|\n"
-                "| `alpha` | `0.01` | ✅ | L1 penalty. Higher = more features zeroed out. |\n"
-                "| `fit_intercept` | `True` | ❌ | Whether to fit β₀. |\n"
-                "| `max_iter` | `1000` | ❌ | Max iterations for coordinate descent. Increase if you see convergence warnings. |\n"
-                "| `tol` | `1e-4` | ❌ | Convergence tolerance. |\n"
-                "| `selection` | `'cyclic'` | ❌ | `'cyclic'` (round-robin) or `'random'` update order. |\n\n"
-                "> Auto-tuning searches: α ∈ {0.0001, 0.001, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0}."
-            )
-
-        with _mtabs[3]:
-            st.markdown("#### Random Forest Regressor")
-            st.markdown(
-                "Builds **T independent decision trees**, each trained on a random bootstrap sample of the data "
-                "and using only a random subset of features at each split (to decorrelate trees). "
-                "The final prediction is the **average** across all trees. "
-                "Naturally handles non-linear relationships and requires no feature scaling."
-            )
-            st.markdown("**Formula:**")
-            st.latex(r"\hat{y} = \frac{1}{T} \sum_{t=1}^{T} f_t(\mathbf{x})")
-            st.markdown(
-                "Each tree *fₜ* is grown on a bootstrap sample using `max_features` features per split. "
-                "Variance is reduced by averaging; bias is controlled by tree depth."
-            )
-            st.markdown("**What inputs does it need?**")
-            st.info(
-                "• Any numeric feature columns — **no scaling required**.\n"
-                "• Handles correlated lag/rolling features well (random feature subsets decorrelate trees).\n"
-                "• Works out-of-the-box with minimal tuning. Increasing n_estimators always helps (up to a point).\n"
-                "• For PM calibration: often outperforms linear models when humidity causes non-linear "
-                "hygroscopic particle growth effects."
-            )
-            st.markdown("**All Hyperparameters:**")
-            st.markdown(
-                "| Parameter | Default | Exposed in UI | What it does |\n"
-                "|-----------|---------|---------------|--------------|\n"
-                "| `n_estimators` | `200` | ✅ | Number of trees. More = stable but slower. 100–500 typical. |\n"
-                "| `max_depth` | `10` | ✅ | Max tree depth. None = fully grown. 5–15 prevents overfitting. |\n"
-                "| `min_samples_split` | `2` | ❌ (auto-tuned) | Min samples required to split a node. Higher = simpler trees. |\n"
-                "| `min_samples_leaf` | `1` | ❌ (auto-tuned) | Min samples in any leaf. Higher = smoother predictions. |\n"
-                "| `max_features` | `'sqrt'` | ❌ (auto-tuned) | Features per split: `'sqrt'`, `'log2'`, or float (fraction). |\n"
-                "| `bootstrap` | `True` | ❌ | Use bootstrap sampling per tree. |\n"
-                "| `oob_score` | `False` | ❌ | Compute out-of-bag validation score for free. |\n"
-                "| `n_jobs` | `-1` | ❌ | CPU threads (−1 = all cores). |\n\n"
-                "> Auto-tuning searches: n_estimators, max_depth, min_samples_split, min_samples_leaf, max_features."
-            )
-
-        with _mtabs[4]:
-            st.markdown("#### XGBoost (Extreme Gradient Boosting)")
-            st.markdown(
-                "Builds trees **sequentially** — each new tree is trained to correct the errors (residuals) "
-                "of all previous trees. Unlike Random Forest (parallel + average), XGBoost **boosts** performance "
-                "step by step. Has built-in L1 + L2 regularisation on leaf weights. "
-                "Typically the most accurate model on tabular data, but needs careful tuning."
-            )
-            st.markdown("**Formula (final prediction after K rounds):**")
-            st.latex(r"\hat{y}^{(K)} = \sum_{k=1}^{K} \eta \cdot f_k(\mathbf{x})")
-            st.markdown("where η = `learning_rate` and each tree minimises:")
-            st.latex(
-                r"\mathcal{L}^{(k)} = \sum_{i} l\!\left(y_i,\, \hat{y}_i^{(k-1)} + f_k(\mathbf{x}_i)\right) + \Omega(f_k)"
-            )
-            st.markdown("**Regularisation term on each tree:**")
-            st.latex(
-                r"\Omega(f) = \gamma T + \tfrac{1}{2}\lambda \sum_{j=1}^{T} w_j^2 + \alpha \sum_{j=1}^{T} |w_j|"
-            )
-            st.markdown(
-                "T = number of leaves · wⱼ = leaf scores · "
-                "γ = min gain to split · λ = L2 (`reg_lambda`) · α = L1 (`reg_alpha`)"
-            )
-            st.markdown("**What inputs does it need?**")
-            st.info(
-                "• Any numeric feature columns — **no scaling required**.\n"
-                "• Handles missing values internally, but we pre-impute in the preprocessing step.\n"
-                "• Benefits the most from rich feature engineering (lag, rolling, interaction terms).\n"
-                "• Best model for large datasets (> 500 rows) with non-linear sensor behaviour.\n"
-                "• Requires `xgboost` package: install with `pip install xgboost`."
-            )
-            st.markdown("**All Hyperparameters:**")
-            st.markdown(
-                "| Parameter | Default | Exposed in UI | What it does |\n"
-                "|-----------|---------|---------------|--------------|\n"
-                "| `n_estimators` | `200` | ✅ | Number of boosting rounds (trees). |\n"
-                "| `max_depth` | `4` | ✅ | Max depth per tree. 3–6 is typical; lower = simpler. |\n"
-                "| `learning_rate` (η) | `0.05` | ✅ | Step size per round. Lower needs more trees. |\n"
-                "| `subsample` | `0.8` | ❌ (auto-tuned) | Fraction of rows sampled per tree. <1 adds randomness. |\n"
-                "| `colsample_bytree` | `0.8` | ❌ (auto-tuned) | Fraction of features used per tree. |\n"
-                "| `reg_alpha` (α) | `0.0` | ❌ (auto-tuned) | L1 on leaf weights. Promotes sparse leaf scores. |\n"
-                "| `reg_lambda` (λ) | `1.0` | ❌ (auto-tuned) | L2 on leaf weights. Smooths predictions. |\n"
-                "| `gamma` | `0` | ❌ | Min loss reduction to split a node. Higher = fewer splits. |\n"
-                "| `min_child_weight` | `1` | ❌ | Min sum of instance weight in a leaf. Prevents tiny splits. |\n"
-                "| `n_jobs` | `-1` | ❌ | CPU threads. |\n\n"
-                "> Auto-tuning searches: n_estimators, max_depth, learning_rate, subsample, colsample_bytree, reg_alpha, reg_lambda."
-            )
+    render_model_reference_guide()
 
     with st.expander("⚙️ Training Settings", expanded=False):
         st.caption(
@@ -2175,6 +1987,10 @@ def render_modelling():
         config["training"]["test_size"] = test_size
         config["training"]["cross_validation_folds"] = cv_folds
         config["training"]["validation_method"] = validation_labels[validation_label]
+
+        _render_time_feature_validation_warning(
+            model_df, ts_col, config["training"]["validation_method"]
+        )
 
         st.markdown("**Model selection**")
         st.caption(
@@ -2290,6 +2106,14 @@ def render_modelling():
             "💡 More iterations (n_iter) = broader search = better results, but slower. "
             "Start with 10–20. Increase to 50–100 for a thorough search on final runs."
         )
+        st.warning(
+            "With K-Fold or TimeSeriesSplit, the search runs **inside every validation fold** "
+            "(nested cross-validation) so the reported metrics stay honest. That costs roughly "
+            "one extra search per fold, so training takes noticeably longer than an untuned run. "
+            "Expect the tuned metrics to shift compared with earlier versions of this app — in "
+            "either direction — because they now measure parameters that never saw the fold "
+            "being scored."
+        )
         tuning_cfg = config["training"].get("tuning", {})
         for mname in ["random_forest", "xgboost", "ridge", "lasso"]:
             c1t, c2t = st.columns([2, 1])
@@ -2309,6 +2133,7 @@ def render_modelling():
             tuning_cfg.setdefault(mname, {})["enabled"] = enabled
             tuning_cfg.setdefault(mname, {})["n_iter"]  = n_iter
         config["training"]["tuning"] = tuning_cfg
+
 
     st.session_state.config = config
 
@@ -2339,14 +2164,16 @@ def render_modelling():
             try:
                 cfg_text = _cfg_to_json(config)
                 subset_json = json.dumps(st.session_state.selected_features)
-                outputs = cached_train_prepared(model_df, target_col, cfg_text, subset_json)
+                outputs = cached_train_prepared(
+                    model_df, target_col, cfg_text, subset_json, norm_method
+                )
                 st.session_state.modeling_outputs = outputs
                 st.session_state.selected_model_name = outputs["best_model_name"]
                 _reset_downstream(*_DOWNSTREAM_FROM_MODELING)
                 _record_run_history("Manual training")
                 st.success("✅ All models trained successfully!")
             except Exception as e:
-                st.error(f"❌ {e}")
+                report_error(e)
 
     out = st.session_state.modeling_outputs
     if out is not None:
@@ -2368,9 +2195,32 @@ def render_modelling():
         tuned = {n: r for n, r in out["training_results"].items() if r.best_params}
         if tuned:
             with st.expander("🔧 Best Hyperparameters Found", expanded=False):
+                st.caption(
+                    "Parameters below come from a final search over all rows and are what "
+                    "the exported model uses. The leaderboard metrics come from a separate "
+                    "nested search run inside each validation fold, so they do not reflect "
+                    "these particular values."
+                )
                 for mname, res in tuned.items():
                     st.markdown(f"**{mname}**")
                     st.json(res.best_params)
+                    per_fold = getattr(res, "nested_best_params", None)
+                    if per_fold:
+                        keys = sorted({k for fold in per_fold for k in fold})
+                        fold_table = pd.DataFrame(
+                            [{"fold": i + 1, **{k: fold.get(k) for k in keys}}
+                             for i, fold in enumerate(per_fold)]
+                        )
+                        unstable = [k for k in keys if len({str(f.get(k)) for f in per_fold}) > 1]
+                        st.caption(
+                            "Parameters chosen inside each validation fold. "
+                            + (f"Varies across folds: {', '.join(unstable)} — the search is "
+                               "unstable on this dataset, so treat the values above as one draw "
+                               "rather than a settled answer."
+                               if unstable else
+                               "Identical across all folds, which suggests a stable search.")
+                        )
+                        st.dataframe(fold_table, width='stretch')
 
     st.markdown("---")
     if st.button("Next ➡️", key="next_modeling_always", width='stretch', disabled=(out is None),
@@ -2426,6 +2276,13 @@ def render_results():
                 "predictions are available for visual inspection, but they are not used for ranking."
             )
         render_metric_row(result.metrics, ["rmse", "mae", "r2", "mape"], ["RMSE", "MAE", "R²", "MAPE"])
+        excluded = result.metrics.get("mape_excluded_fraction")
+        if isinstance(excluded, float) and excluded > 0:
+            st.caption(
+                f"MAPE ignores the {excluded:.0%} of observations with a reference value below "
+                f"{MAPE_MIN_DENOMINATOR:g}, where a percentage reflects the near-zero denominator "
+                "rather than the model. Judge low-concentration performance by RMSE or MAE."
+            )
         st.markdown("")
         render_metric_row(result.metrics, ["bias", "pearson_r", "slope", "intercept"],
                           ["Bias", "Pearson r", "Slope", "Intercept"])
@@ -2723,7 +2580,13 @@ def render_export():
     ts_col = config["data"]["timestamp_column"]
     target_col = st.session_state.selected_target or f"{config['data']['reference_prefix']}_{config['data']['target_column']}"
 
-    predictions = predict_with_model(result.model, out["featured_data"], target_col, ts_col)
+    predictions = predict_with_model(
+        result.model,
+        out["featured_data"],
+        target_col,
+        ts_col,
+        feature_names=result.feature_names,
+    )
     calibrated = (
         out["featured_data"][[ts_col, target_col]]
         .merge(predictions, on=ts_col, how="left")
@@ -2766,7 +2629,7 @@ def render_export():
                     coefficient_table=getattr(result, "coefficient_table", None),
                     selected_target=st.session_state.selected_target,
                     selected_predictors=st.session_state.selected_predictors,
-                    modelling_objective=config.get("modelling", {}).get("objective"),
+                    modelling_objective=config.get("training", {}).get("modelling_objective"),
                     leaderboard=out["leaderboard"],
                     training_results=out["training_results"],
                     prepared_dataset=out["featured_data"],
@@ -2774,7 +2637,7 @@ def render_export():
                 st.session_state.export_bundle = bundle
                 st.success("✅ Export bundle ready!")
             except Exception as e:
-                st.error(f"❌ {e}")
+                report_error(e)
 
     bundle = st.session_state.export_bundle
     if bundle is not None:
@@ -2837,10 +2700,15 @@ _DEFAULT_README = """\
 | 2 | **Preprocessing** | Choose missing-value strategy (interpolate_ffill / ffill / bfill / interpolate) and outlier method for sensor data. Optionally apply to reference too. |
 | 3 | **Alignment** | Resample both datasets to a common frequency, auto-detect time lag, and merge. |
 | 4 | **EDA** | Explore distributions, correlations, missing-value heatmap, and anomaly detection. |
-| 5 | **Modelling** | Configure lag/rolling/polynomial/interaction/time features; select variables; tune hyperparameters; train and compare models. |
-| 6 | **Results** | Inspect leaderboard, feature importance, scatter + time-series per model. |
-| 7 | **Post-Analysis** | Rolling error drift, Bland-Altman agreement, residual plots. |
-| 8 | **Export** | Download calibrated CSV, model .pkl, metrics JSON, config YAML/JSON, metadata JSON. |
+| 5 | **Variable Selection** | Pick the target and predictors. Reference-instrument channels and columns that encode the target are excluded by default. |
+| 6 | **Feature Engineering** | Lag, rolling, polynomial, interaction and time features. |
+| 7 | **Normalization** | Pick a scaler; it is fit inside the model, per training fold, and exported with it. |
+| 8 | **Modelling** | Select models, set hyperparameters or enable nested auto-tuning, optionally restrict the feature subset, train. |
+| 9 | **Validation & Results** | Leaderboard, metrics, explainability, multi-model comparison. |
+| 10 | **Statistical Diagnostics** | OLS coefficients, VIF, Shapiro-Wilk. *(Advanced)* |
+| 11 | **Residual Analysis** | Predicted vs actual, residual vs fitted, histogram, Q-Q plot. *(Advanced)* |
+| 12 | **README** | These notes. *(Advanced)* |
+| 13 | **Export** | Download calibrated CSV, model .pkl, metrics JSON, config YAML/JSON, metadata JSON. |
 
 ---
 
@@ -2922,7 +2790,6 @@ and gives it to the model as a new input. This lets the model learn from recent 
 - **Feature preview** lets you see all engineered columns before selecting a subset for training.
 - **Variable selection** is reset each time you click *Preview Features* — re-select your subset if needed.
 - **Reference preprocessing**: missing-value imputation always applies; outlier removal is opt-in.
-- **Bland-Altman** plot: toggle in Post-Analysis settings. Points within ±1.96σ = good agreement.
 - All exports include provenance metadata (model name, features used, metrics, config) for reproducibility.
 - Hover over any **?** icon in the UI for contextual guidance.
 

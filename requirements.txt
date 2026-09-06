@@ -1,12 +1,22 @@
-pandas
-numpy
-scikit-learn
-xgboost
-plotly
-streamlit
-PyYAML
-scipy
-joblib
-statsmodels
-kaleido
-fpdf2
+# Floors are conservative: they record versions the suite has actually been run
+# against, not the oldest that would work. Two are load-bearing rather than
+# cautious, and say so.
+pandas>=2.2
+numpy>=1.26
+scikit-learn>=1.2       # set_output(transform="pandas") keeps feature names through the scaling pipeline
+xgboost                 # optional; skipped gracefully when absent
+plotly>=5.18
+streamlit>=1.56         # st.download_button accepts a callable (deferred payloads); 1.56 is
+                        # the version this was verified on, and every download button in the
+                        # app depends on it -- an older floor was a guess, not a check
+PyYAML>=6.0
+scipy>=1.11
+joblib>=1.3
+statsmodels>=0.14
+kaleido>=0.2            # PNG export for Plotly figures
+fpdf2>=2.7              # PDF reports
+pytest>=8.0
+
+# Verified against: pandas 3.0.2, numpy 2.4.4, scikit-learn 1.8.0, streamlit 1.56.0,
+# plotly 6.7.0, statsmodels 0.14.6, scipy 1.17.1, kaleido 1.3.0, fpdf2 2.8.7,
+# xgboost 3.2.0, pytest 9.1.1, on Python 3.12.

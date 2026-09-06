@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Iterable, List
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -18,6 +18,13 @@ class PreprocessingSummary:
     rows_removed_as_outliers: int
     numeric_columns: List[str]
     percentage_removed: float = 0.0
+    # Rows each column would remove on its own. A row is dropped if *any*
+    # screened column calls it an outlier, so the total is far larger than any
+    # single entry once several columns are screened -- with independent
+    # columns the survival rates multiply. Showing the breakdown is what makes
+    # a surprising total explainable.
+    outlier_rows_by_column: Dict[str, int] = field(default_factory=dict)
+    outlier_columns: List[str] = field(default_factory=list)
 
     @property
     def rows_removed(self) -> int:
@@ -152,6 +159,36 @@ def clean_missing_values(
     return transformed
 
 
+def outlier_mask_by_column(
+    dataframe: pd.DataFrame,
+    numeric_columns: List[str],
+    method: str,
+    threshold: float,
+) -> Dict[str, pd.Series]:
+    """Per-column keep-masks, so each column's contribution stays visible."""
+    method_key = _canonical_outlier_method(method)
+    masks: Dict[str, pd.Series] = {}
+    if method_key == "none" or not numeric_columns:
+        return masks
+
+    if method_key == "zscore":
+        values = dataframe[numeric_columns]
+        std = values.std(ddof=0).replace(0, np.nan)
+        zscores = ((values - values.mean()) / std).abs().fillna(0)
+        for column in numeric_columns:
+            masks[column] = zscores[column] <= threshold
+        return masks
+
+    for column in numeric_columns:
+        q1 = dataframe[column].quantile(0.25)
+        q3 = dataframe[column].quantile(0.75)
+        iqr = q3 - q1
+        lower = q1 - threshold * iqr
+        upper = q3 + threshold * iqr
+        masks[column] = dataframe[column].between(lower, upper) | dataframe[column].isna()
+    return masks
+
+
 def detect_outlier_mask_iqr(
     dataframe: pd.DataFrame,
     numeric_columns: List[str],
@@ -159,13 +196,8 @@ def detect_outlier_mask_iqr(
 ) -> pd.Series:
     """Create an IQR-based row mask for non-outlier observations."""
     mask = pd.Series(True, index=dataframe.index)
-    for column in numeric_columns:
-        q1 = dataframe[column].quantile(0.25)
-        q3 = dataframe[column].quantile(0.75)
-        iqr = q3 - q1
-        lower = q1 - multiplier * iqr
-        upper = q3 + multiplier * iqr
-        mask &= dataframe[column].between(lower, upper) | dataframe[column].isna()
+    for column_mask in outlier_mask_by_column(dataframe, numeric_columns, "iqr", multiplier).values():
+        mask &= column_mask
     return mask
 
 
@@ -219,7 +251,10 @@ def preprocess_dataset(
     timestamp_column:
         Timestamp field.
     config:
-        Preprocessing settings.
+        Preprocessing settings. ``outlier_columns`` narrows the outlier screen
+        to named columns; by default every numeric column is screened, and
+        because a row is dropped when *any* of them objects, the loss grows
+        with the number of columns even on clean data.
     exclude_columns:
         Columns excluded from numeric preprocessing.
 
@@ -240,11 +275,20 @@ def preprocess_dataset(
         method=str(config.get("missing_strategy", "linear_interpolation_forward_fill")),
     )
     rows_after_missing = len(transformed)
+
+    requested = [str(c) for c in (config.get("outlier_columns") or [])]
+    outlier_columns = [c for c in requested if c in numeric_columns] if requested else list(numeric_columns)
+
+    method = str(config.get("outlier_method", "iqr"))
+    threshold = float(config.get("outlier_threshold", 1.5))
+    per_column = outlier_mask_by_column(transformed, outlier_columns, method, threshold)
+    rows_by_column = {column: int((~mask).sum()) for column, mask in per_column.items()}
+
     transformed = remove_outliers(
         dataframe=transformed,
-        numeric_columns=numeric_columns,
-        method=str(config.get("outlier_method", "iqr")),
-        threshold=float(config.get("outlier_threshold", 1.5)),
+        numeric_columns=outlier_columns,
+        method=method,
+        threshold=threshold,
     )
     summary = PreprocessingSummary(
         original_rows=original_rows,
@@ -254,5 +298,7 @@ def preprocess_dataset(
         percentage_removed=round(
             (max(0, original_rows - len(transformed)) / original_rows * 100) if original_rows > 0 else 0.0, 2
         ),
+        outlier_rows_by_column=dict(sorted(rows_by_column.items(), key=lambda kv: -kv[1])),
+        outlier_columns=outlier_columns,
     )
     return transformed, summary
