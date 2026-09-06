@@ -10,3 +10,4 @@ joblib
 statsmodels
 kaleido
 fpdf2
+pytest

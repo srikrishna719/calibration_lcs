@@ -88,7 +88,9 @@ streamlit run ui/app.py
 ## Smoke Test
 
 ```bash
-python tests/smoke_test.py
+pytest                      # full suite
+pytest -m "not slow"        # skip the multi-model pipeline runs
+pytest -m realdata          # only the 2025 co-location tests (skipped if data/ is absent)
 ```
 
 ## Workflow (8 Steps)

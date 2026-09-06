@@ -27,9 +27,21 @@ streamlit run ui/app.py --server.port 8502        # alternate port
 python pipeline/run_pipeline.py
 ```
 
-There is **no automated test suite** and no linter configured. Modules are validated by
-running the app or invoking pipeline stages directly. `COMMANDS.md` has the full command
-reference.
+Tests are pytest, under `tests/`, with fixtures in `tests/conftest.py`:
+
+```bash
+pytest                    # full suite
+pytest -m "not slow"      # skip multi-model pipeline runs
+pytest -m realdata        # only the 2025 co-location tests
+```
+
+Two markers matter. `slow` covers full-pipeline runs. `realdata` needs
+`data/processed_2025_trends/`, which is gitignored, so those tests skip when it is
+absent — they exist because the bundled sample data is synthetic and tidy, while the
+real file carries text columns, all-NaN channels, duplicate timestamps across
+co-located devices, and derived columns that encode the target.
+
+No linter is configured. `COMMANDS.md` has the full command reference.
 
 ## Architecture
 
