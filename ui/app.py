@@ -62,12 +62,6 @@ from ui.workflow import (
 )
 from models.predict import predict_with_model
 from models.model_registry import MODEL_GROUPS, MODEL_DISPLAY_NAMES
-from modules.drift_analysis import (
-    create_predicted_vs_actual_figure,
-    create_qq_plot,
-    create_residual_histogram,
-    create_residual_vs_predicted_figure,
-)
 from modules.download_helpers import render_chart_download, render_df_download
 from config.validation import load_config_text
 from evaluation.metrics import MAPE_MIN_DENOMINATOR
@@ -77,6 +71,10 @@ from modules.normalization import get_normalization_summary, normalize_dataset
 from modules.diagnostics import COEFFICIENT_TABLE_COLUMNS, compute_vif, shapiro_wilk_test
 from modules.plots import (
     create_multi_model_metrics_bar,
+    create_predicted_vs_actual_figure,
+    create_qq_plot,
+    create_residual_histogram,
+    create_residual_vs_predicted_figure,
     create_multi_model_scatter,
     create_multi_model_timeseries,
     create_scatter_with_fit,
@@ -531,7 +529,6 @@ def init_state():
         "feature_engineering_outputs": None,
         "normalization_outputs": None,
         "diagnostics_outputs": None,
-        "post_analysis_outputs": None,
         "residual_analysis_outputs": None,
         "export_bundle": None,
         "run_history": [],
@@ -558,24 +555,24 @@ _DOWNSTREAM_FROM_UPLOAD = (
     "preprocessing_outputs", "alignment_outputs", "eda_outputs",
     "selected_target", "selected_predictors", "selected_model_name",
     "variable_selection_outputs", "feature_engineering_outputs", "normalization_outputs",
-    "modeling_outputs", "diagnostics_outputs", "post_analysis_outputs",
+    "modeling_outputs", "diagnostics_outputs",
     "residual_analysis_outputs", "export_bundle", "featured_preview", "selected_features",
 )
 _DOWNSTREAM_FROM_PREPROCESSING = (
     "alignment_outputs", "eda_outputs", "selected_target", "selected_predictors",
     "selected_model_name", "variable_selection_outputs", "feature_engineering_outputs",
     "normalization_outputs", "modeling_outputs", "diagnostics_outputs",
-    "post_analysis_outputs", "residual_analysis_outputs", "export_bundle",
+    "residual_analysis_outputs", "export_bundle",
     "featured_preview", "selected_features",
 )
 _DOWNSTREAM_FROM_ALIGNMENT = (
     "eda_outputs", "selected_target", "selected_predictors", "selected_model_name",
     "variable_selection_outputs", "feature_engineering_outputs", "normalization_outputs",
-    "modeling_outputs", "diagnostics_outputs", "post_analysis_outputs",
+    "modeling_outputs", "diagnostics_outputs",
     "residual_analysis_outputs", "export_bundle", "featured_preview", "selected_features",
 )
 _DOWNSTREAM_FROM_MODELING = (
-    "diagnostics_outputs", "post_analysis_outputs", "residual_analysis_outputs", "export_bundle"
+    "diagnostics_outputs", "residual_analysis_outputs", "export_bundle"
 )
 
 
@@ -766,7 +763,6 @@ def render_upload():
                     st.session_state[state_key] = state_value
                 _reset_downstream(
                     "diagnostics_outputs",
-                    "post_analysis_outputs",
                     "residual_analysis_outputs",
                     "export_bundle",
                 )

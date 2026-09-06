@@ -17,7 +17,6 @@ from models.predict import predict_with_model
 from models.train import fitted_scaler, train_models
 from modules.alignment import align_and_merge_datasets
 from modules.data_loader import load_and_validate_dataset
-from modules.drift_analysis import generate_post_analysis_outputs
 from modules.eda import generate_eda_outputs
 from modules.exporter import (
     export_config_json_bytes,
@@ -560,26 +559,7 @@ def train_on_prepared_dataset(
 
 
 # -----------------------------------------------------------------------
-# Stage 6 — Post-Calibration Analysis
-# -----------------------------------------------------------------------
-
-def run_post_analysis_stage(
-    predictions_df: Any,
-    config: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Run drift detection and residual analysis."""
-    drift_cfg = config.get("drift_analysis", {})
-    rolling_window = int(drift_cfg.get("rolling_window", 6))
-    drift_threshold = float(drift_cfg.get("drift_threshold", 1.5))
-    return generate_post_analysis_outputs(
-        predictions_df,
-        rolling_window=rolling_window,
-        drift_threshold=drift_threshold,
-    )
-
-
-# -----------------------------------------------------------------------
-# Stage 7 — Export
+# Stage 6 — Export
 # -----------------------------------------------------------------------
 
 def build_export_bundle(
@@ -678,15 +658,6 @@ def run_full_pipeline(
     modeling = run_modeling_stage(alignment["merged_data"], config)
 
     best_result = modeling["training_results"][modeling["best_model_name"]]
-    # Drift is a question about held-out behaviour. full_predictions come from
-    # the final model refit on every row, so rolling error computed on them
-    # understates drift everywhere.
-    post = run_post_analysis_stage(
-        best_result.validation_predictions
-        if best_result.validation_predictions is not None
-        else best_result.full_predictions,
-        config,
-    )
 
     export = build_export_bundle(
         calibrated_dataset=modeling["calibrated_dataset"],
@@ -705,6 +676,5 @@ def run_full_pipeline(
         **alignment,
         **eda,
         **modeling,
-        **post,
         **export,
     }

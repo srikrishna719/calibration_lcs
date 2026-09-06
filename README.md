@@ -44,10 +44,8 @@ modules/
   eda.py                 — Distributions, correlation heatmap, missing-value heatmap, time-series, anomalies
   feature_engineering.py — Lag, rolling, time features; polynomial expansion; pairwise interactions
   leakage.py             — Pairwise detection of predictors encoding the target or a reference channel
-  drift_analysis.py      — Residual/Q-Q figures used by the UI; rolling RMSE/MAE/Bias and drift
-                           detection, reachable via run_full_pipeline but not yet a UI step
   exporter.py            — CSV/JSON/YAML/pickle serialization with provenance metadata
-  plots.py               — Centralised plotting utilities (scatter, Bland-Altman, multi-model grid)
+  plots.py               — Plotting utilities (scatter, multi-model grid, residual diagnostics)
 models/
   model_registry.py      — Supported regressors with parameter overrides
   train.py               — Time-aware split, TimeSeriesSplit CV, feature importance, RandomizedSearchCV
@@ -56,7 +54,7 @@ evaluation/
   metrics.py             — Full calibration metric suite
   comparator.py          — Ranked leaderboard with all metrics
 pipeline/
-  run_pipeline.py        — 7-stage orchestrator (load → preprocess → align → EDA → model → post-analysis → export)
+  run_pipeline.py        — 6-stage orchestrator (load → preprocess → align → EDA → model → export)
 ui/
   app.py                 — 13-step Streamlit workflow
   theme.py               — Light/dark palettes and the CSS block
@@ -121,9 +119,7 @@ Steps 10-12 appear in Advanced mode only.
 12. **README** — In-app editable notes *(Advanced)*
 13. **Export** — Calibrated CSV, model `.pkl`, metrics JSON, all-model metrics JSON, researcher PDF, config YAML/JSON, metadata JSON
 
-Rolling-error drift detection lives in `modules/drift_analysis.py` and runs as part of
-`run_full_pipeline`, but has no UI step of its own. The Bland-Altman plot in
-`modules/plots.py` is likewise not wired into the app.
+The Bland-Altman plot in `modules/plots.py` is not wired into the app.
 
 ## Calibration Metrics
 

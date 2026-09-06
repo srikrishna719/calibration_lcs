@@ -56,7 +56,7 @@ Everything is driven by a single config dict loaded from `config/default.yaml`
 global state. Top-level keys: `app`, `data`, `preprocessing` (with independent `reference`
 and `sensor` sub-configs), `alignment`, `feature_engineering`, `normalization`, `training`
 (includes `selected_models`, `model_params`, `validation_method`, optional `tuning`),
-`evaluation`, `drift_analysis`. When adding a feature, add its knobs here first.
+`evaluation`. When adding a feature, add its knobs here first.
 
 ### Pipeline stages (`pipeline/run_pipeline.py`)
 Discrete functions, each taking the config dict, runnable independently or via
@@ -69,8 +69,7 @@ Discrete functions, each taking the config dict, runnable independently or via
 5. `run_modeling_stage` → `modules/feature_engineering.py` + `modules/normalization.py` +
    `models/train.py` + `evaluation/comparator.py` (engineer features, optional scaling, train,
    rank leaderboard, produce calibrated dataset)
-6. `run_post_analysis_stage` → `modules/drift_analysis.py` (rolling error, drift detection, residuals)
-7. `build_export_bundle` → `modules/exporter.py` (CSV, model `.pkl`, metrics JSON, config
+6. `build_export_bundle` → `modules/exporter.py` (CSV, model `.pkl`, metrics JSON, config
    YAML/JSON, metadata JSON, optional PDF report)
 
 Note the target column naming convention: after alignment the reference target is prefixed,
@@ -109,7 +108,7 @@ Single large module — the only entry point. Patterns to follow when editing:
 - **Caching**: `cached_*` wrappers (`@st.cache_data`) re-key on a serialized config **string**
   (`_cfg_to_json` / config text), because dicts aren't hashable. When changing what a stage
   consumes, make sure the relevant `cached_*` signature includes it so the cache invalidates.
-- Plotting helpers live in `modules/plots.py` and `modules/drift_analysis.py`; download
+- Plotting helpers live in `modules/plots.py`; download
   buttons in `modules/download_helpers.py`; diagnostics (VIF, Shapiro-Wilk, coefficient
   tables) in `modules/diagnostics.py`. Keep computation out of the UI.
 
